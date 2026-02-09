@@ -1235,16 +1235,22 @@ async def process_category_selection(callback: CallbackQuery, state: FSMContext)
     category = callback.data.replace("cat_", "").upper()
     await state.update_data(category=category)
     
-    if category == "SUPERCELL":
-        # Выбор типа аккаунта - Перепривязка или Почта
+    # Для SUPERCELL, FREE FIRE, PUBG - выбор между ПП или Почта+Пароль
+    if category in ["SUPERCELL", "FREEFIRE", "PUBG"]:
+        category_names = {
+            "SUPERCELL": "🎮 SUPERCELL",
+            "FREEFIRE": "🔥 FREE FIRE",
+            "PUBG": "🎯 PUBG MOBILE"
+        }
+        
         buttons = [
-            [InlineKeyboardButton(text="🔄 Перепривязка (ПП)", callback_data="supercell_pp")],
-            [InlineKeyboardButton(text="📧 Почта + Пароль", callback_data="supercell_email")],
+            [InlineKeyboardButton(text="🔄 Перепривязка (ПП)", callback_data="account_pp")],
+            [InlineKeyboardButton(text="📧 Почта + Пароль", callback_data="account_email")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
         ]
         
         await callback.message.answer(
-            "🎮 <b>SUPERCELL</b>\n\n"
+            f"{category_names.get(category, category)}\n\n"
             "Выберите тип аккаунта:",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1267,33 +1273,49 @@ async def process_category_selection(callback: CallbackQuery, state: FSMContext)
         )
         await state.set_state(ProductStates.waiting_for_stars_amount)
         
-    else:
-        # Для остальных категорий (FREE FIRE, PUBG, STANDOFF 2)
+    elif category == "STANDOFF":
+        # STANDOFF 2 - только описание, БЕЗ почты/пароля
         await callback.message.answer(
-            f"📝 Опишите что вы продаёте:\n"
-            f"(подробно опишите товар)"
+            "🔫 <b>STANDOFF 2</b>\n\n"
+            "📝 Опишите что вы продаёте:\n"
+            "(подробно опишите товар)",
+            parse_mode="HTML"
         )
         await state.set_state(ProductStates.waiting_for_product_description)
 
 @dp.callback_query(ProductStates.selecting_supercell_type)
-async def process_supercell_type(callback: CallbackQuery, state: FSMContext):
-    """Обработка типа SUPERCELL аккаунта"""
+async def process_account_type(callback: CallbackQuery, state: FSMContext):
+    """Обработка типа аккаунта (для SUPERCELL, FREE FIRE, PUBG)"""
     await callback.answer()
     
-    if callback.data == "supercell_pp":
-        # Перепривязка - сразу скриншоты
+    data = await state.get_data()
+    category = data.get("category")
+    
+    if callback.data == "account_pp":
+        # Перепривязка - БЕЗ почты/пароля
         await state.update_data(account_type="pp", email="ПП", password="ПП")
-        await callback.message.answer(
-            "🔄 <b>Перепривязка</b>\n\n"
-            "Отправьте скриншоты аккаунта.\n"
-            "Когда закончите, введите /done",
-            parse_mode="HTML"
-        )
-        await state.update_data(screenshots=[])
-        await state.set_state(ProductStates.waiting_for_screenshots)
         
-    elif callback.data == "supercell_email":
-        # Почта - запрашиваем email и пароль
+        if category == "SUPERCELL":
+            # Для SUPERCELL - сначала скриншоты
+            await callback.message.answer(
+                "🔄 <b>Перепривязка</b>\n\n"
+                "Отправьте скриншоты аккаунта.\n"
+                "Когда закончите, введите /done",
+                parse_mode="HTML"
+            )
+            await state.update_data(screenshots=[])
+            await state.set_state(ProductStates.waiting_for_screenshots)
+        else:
+            # Для FREE FIRE и PUBG - сразу описание
+            await callback.message.answer(
+                "🔄 <b>Перепривязка</b>\n\n"
+                "📝 Опишите что вы продаёте:",
+                parse_mode="HTML"
+            )
+            await state.set_state(ProductStates.waiting_for_product_description)
+        
+    elif callback.data == "account_email":
+        # Почта + Пароль
         await state.update_data(account_type="email")
         await callback.message.answer(
             "📧 Введите email (почту) аккаунта:"
@@ -1362,11 +1384,19 @@ async def process_stars_amount(message: Message, state: FSMContext):
 async def process_product_general_description(message: Message, state: FSMContext):
     """Обработка общего описания товара"""
     description = message.text.strip()
-    await state.update_data(
-        email="Описание ниже",
-        password="-",
-        description=description
-    )
+    data = await state.get_data()
+    category = data.get("category")
+    
+    # Для категорий без почты/пароля (STANDOFF) устанавливаем заглушки
+    if category in ["STANDOFF"]:
+        await state.update_data(
+            email="-",
+            password="-",
+            description=description
+        )
+    else:
+        # Для FREE FIRE и PUBG с ПП
+        await state.update_data(description=description)
     
     await message.answer("💰 Введите цену товара (в рублях):")
     await state.set_state(ProductStates.waiting_for_price)
@@ -1393,9 +1423,11 @@ async def process_product_password(message: Message, state: FSMContext):
     category = data.get("category")
     
     if category == "SUPERCELL":
+        # Для SUPERCELL - спрашиваем кубки
         await message.answer("🏆 Введите количество кубков:")
         await state.set_state(ProductStates.waiting_for_trophies)
     else:
+        # Для FREE FIRE и PUBG - описание
         await message.answer("📝 Введите описание товара (или /skip чтобы пропустить):")
         await state.set_state(ProductStates.waiting_for_description)
 
@@ -1451,7 +1483,11 @@ async def process_product_price(message: Message, state: FSMContext):
     data = await state.get_data()
     category = data.get("category")
     
-    if category != "SUPERCELL" and not data.get("screenshots"):
+    # Для NFT, STARS, STANDOFF - скриншоты НЕ нужны
+    if category in ["NFT", "STARS", "STANDOFF"]:
+        await finish_product_creation(message, state)
+    # Для остальных - если еще нет скриншотов, запрашиваем
+    elif not data.get("screenshots"):
         await message.answer(
             "📸 Отправьте скриншоты товара (фото).\n"
             "Когда закончите, отправьте команду /done"
