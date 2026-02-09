@@ -1,30 +1,34 @@
 """
 Telegram-бот для сделок с товарами
 Версия для деплоя на Render с PostgreSQL
+Улучшенная версия с передачей товаров и картинками
 """
 
 import asyncio
 import logging
 import os
+import base64
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, PhotoSize
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, PhotoSize, InputFile, FSInputFile, BufferedInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from io import BytesIO
 
 # ================== НАСТРОЙКИ ==================
 
-# Переменные окружения (будут установлены на Render)
+# Переменные окружения (будут установлены на Render/Railway)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 MAIN_ADMIN_ID = int(os.getenv("MAIN_ADMIN_ID", "0"))
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
 DEALS_CHANNEL_ID = int(os.getenv("DEALS_CHANNEL_ID", "0")) if os.getenv("DEALS_CHANNEL_ID") else None
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "support")
+IMGBB_API_KEY = os.getenv("IMGBB_API_KEY", "")
 
 # Все админы
 ALL_ADMINS = [MAIN_ADMIN_ID] + ADMIN_IDS
@@ -63,11 +67,12 @@ async def init_db():
                 )
             ''')
             
-            # Таблица товаров
+            # Таблица товаров (добавлено поле owner_id для отслеживания текущего владельца)
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS products (
                     id SERIAL PRIMARY KEY,
                     user_id BIGINT REFERENCES users(user_id),
+                    owner_id BIGINT REFERENCES users(user_id),
                     name TEXT,
                     category TEXT,
                     email TEXT,
@@ -75,9 +80,19 @@ async def init_db():
                     price TEXT,
                     trophies TEXT,
                     description TEXT,
+                    is_sold BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            # Добавляем колонку owner_id если её нет (для миграции)
+            try:
+                await conn.execute('ALTER TABLE products ADD COLUMN IF NOT EXISTS owner_id BIGINT REFERENCES users(user_id)')
+                await conn.execute('ALTER TABLE products ADD COLUMN IF NOT EXISTS is_sold BOOLEAN DEFAULT FALSE')
+                # Устанавливаем owner_id = user_id для существующих товаров
+                await conn.execute('UPDATE products SET owner_id = user_id WHERE owner_id IS NULL')
+            except:
+                pass
             
             # Таблица скриншотов
             await conn.execute('''
@@ -101,10 +116,39 @@ async def init_db():
                 )
             ''')
             
+            # Таблица картинок для уведомлений (для админа)
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS notification_images (
+                    id SERIAL PRIMARY KEY,
+                    key TEXT UNIQUE,
+                    file_id TEXT,
+                    imgbb_url TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Таблица запросов на пополнение/вывод
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS payment_requests (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT REFERENCES users(user_id),
+                    request_type TEXT,
+                    method TEXT,
+                    amount DECIMAL(10, 2),
+                    card_number TEXT,
+                    bank_name TEXT,
+                    crypto_network TEXT,
+                    crypto_address TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
             # Индексы для оптимизации
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_products_user_id ON products(user_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_products_owner_id ON products(owner_id)')
             
         logger.info("База данных инициализирована успешно")
     except Exception as e:
@@ -155,10 +199,12 @@ async def update_balance(user_id: int, amount: float):
         )
 
 async def get_user_products(user_id: int) -> List[dict]:
-    """Получает все товары пользователя"""
+    """Получает все товары пользователя (только не проданные и принадлежащие ему)"""
     async with db_pool.acquire() as conn:
         products = await conn.fetch(
-            'SELECT * FROM products WHERE user_id = $1 ORDER BY created_at DESC',
+            '''SELECT * FROM products 
+               WHERE owner_id = $1 AND is_sold = FALSE 
+               ORDER BY created_at DESC''',
             user_id
         )
         
@@ -187,8 +233,8 @@ async def add_product(user_id: int, product_data: dict) -> int:
     """Добавляет товар"""
     async with db_pool.acquire() as conn:
         product_id = await conn.fetchval(
-            '''INSERT INTO products (user_id, name, category, email, password, price, trophies, description)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id''',
+            '''INSERT INTO products (user_id, owner_id, name, category, email, password, price, trophies, description, is_sold)
+               VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, FALSE) RETURNING id''',
             user_id,
             product_data.get('name'),
             product_data.get('category'),
@@ -207,6 +253,15 @@ async def add_product(user_id: int, product_data: dict) -> int:
             )
         
         return product_id
+
+async def transfer_product(product_id: int, new_owner_id: int):
+    """Передает товар новому владельцу"""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            'UPDATE products SET owner_id = $1, is_sold = TRUE WHERE id = $2',
+            new_owner_id, product_id
+        )
+        logger.info(f"Товар {product_id} передан пользователю {new_owner_id}")
 
 async def add_message(user_id: int, partner_id: int, sender_id: int, text: str):
     """Сохраняет сообщение в БД"""
@@ -259,6 +314,99 @@ async def cleanup_old_messages():
         )
         logger.info(f"Удалено старых сообщений: {deleted}")
 
+async def save_notification_image(key: str, file_id: str, imgbb_url: str = None):
+    """Сохраняет картинку для уведомлений"""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''INSERT INTO notification_images (key, file_id, imgbb_url) 
+               VALUES ($1, $2, $3)
+               ON CONFLICT (key) DO UPDATE SET file_id = $2, imgbb_url = $3''',
+            key, file_id, imgbb_url
+        )
+
+async def get_notification_image(key: str) -> Optional[dict]:
+    """Получает картинку для уведомлений"""
+    async with db_pool.acquire() as conn:
+        result = await conn.fetchrow(
+            'SELECT file_id, imgbb_url FROM notification_images WHERE key = $1',
+            key
+        )
+        return dict(result) if result else None
+
+async def create_payment_request(user_id: int, request_type: str, data: dict) -> int:
+    """Создает запрос на пополнение/вывод"""
+    async with db_pool.acquire() as conn:
+        request_id = await conn.fetchval(
+            '''INSERT INTO payment_requests 
+               (user_id, request_type, method, amount, card_number, bank_name, crypto_network, crypto_address, status)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending') RETURNING id''',
+            user_id,
+            request_type,
+            data.get('method'),
+            data.get('amount'),
+            data.get('card_number'),
+            data.get('bank_name'),
+            data.get('crypto_network'),
+            data.get('crypto_address')
+        )
+        return request_id
+
+async def get_user_payment_requests(user_id: int) -> List[dict]:
+    """Получает запросы пользователя"""
+    async with db_pool.acquire() as conn:
+        requests = await conn.fetch(
+            'SELECT * FROM payment_requests WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20',
+            user_id
+        )
+        return [dict(r) for r in requests]
+
+async def get_users_with_deals(admin_id: int) -> List[int]:
+    """Получает пользователей, с которыми админ имел сделки"""
+    async with db_pool.acquire() as conn:
+        # Находим всех пользователей из сообщений где админ был партнером
+        users = await conn.fetch(
+            '''SELECT DISTINCT user_id FROM messages 
+               WHERE partner_id = $1 OR sender_id = $1''',
+            admin_id
+        )
+        return [u['user_id'] for u in users if u['user_id'] != admin_id]
+
+# ================== IMGBB ФУНКЦИИ ==================
+
+async def upload_photo_to_imgbb(file_id: str) -> Optional[str]:
+    """Загружает фото на ImgBB и возвращает URL"""
+    if not IMGBB_API_KEY:
+        logger.warning("ImgBB API ключ не установлен")
+        return None
+    
+    try:
+        import aiohttp
+        
+        # Скачиваем файл от Telegram
+        file = await bot.get_file(file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        
+        # Кодируем в base64
+        file_base64 = base64.b64encode(file_bytes.read()).decode('utf-8')
+        
+        # Загружаем на ImgBB
+        async with aiohttp.ClientSession() as session:
+            data = {
+                'key': IMGBB_API_KEY,
+                'image': file_base64
+            }
+            async with session.post('https://api.imgbb.com/1/upload', data=data) as resp:
+                result = await resp.json()
+                if result.get('success'):
+                    url = result['data']['url']
+                    logger.info(f"Фото загружено на ImgBB: {url}")
+                    return url
+        
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка загрузки на ImgBB: {e}")
+        return None
+
 # ================== FSM СОСТОЯНИЯ ==================
 
 class DealStates(StatesGroup):
@@ -278,15 +426,21 @@ class ProductStates(StatesGroup):
 class WithdrawalStates(StatesGroup):
     selecting_method = State()
     waiting_for_card = State()
+    selecting_crypto_network = State()
+    waiting_for_crypto_address = State()
 
 class DepositStates(StatesGroup):
     selecting_method = State()
     waiting_for_amount = State()
+    selecting_bank = State()
+    selecting_crypto_network = State()
+    waiting_for_crypto_amount = State()
 
 class AdminStates(StatesGroup):
     viewing_users = State()
     replying_to_user = State()
     broadcast_message = State()
+    upload_notification_image = State()
 
 # ================== ИНИЦИАЛИЗАЦИЯ БОТА ==================
 
@@ -320,6 +474,7 @@ def get_main_menu(user_id: int = None):
         [InlineKeyboardButton(text="💳 Пополнить", callback_data="deposit")],
         [InlineKeyboardButton(text="💸 Вывод", callback_data="withdrawal")],
         [InlineKeyboardButton(text="➕ Добавить товар", callback_data="add_product")],
+        [InlineKeyboardButton(text="📦 Мои товары", callback_data="my_products")],
         [InlineKeyboardButton(text="👥 Реферальная система", callback_data="referral")]
     ]
     
@@ -377,6 +532,26 @@ def get_product_categories_keyboard():
         [InlineKeyboardButton(text="⭐️ TELEGRAM STARS", callback_data="cat_stars")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
     ])
+
+async def send_with_image(chat_id: int, text: str, image_key: str = None, reply_markup = None):
+    """Отправляет сообщение с картинкой если она есть"""
+    if image_key and IMGBB_API_KEY:
+        image_data = await get_notification_image(image_key)
+        if image_data and image_data.get('imgbb_url'):
+            try:
+                await bot.send_photo(
+                    chat_id,
+                    photo=image_data['imgbb_url'],
+                    caption=text,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML"
+                )
+                return
+            except Exception as e:
+                logger.error(f"Ошибка отправки с картинкой: {e}")
+    
+    # Если картинки нет или ошибка - отправляем обычное сообщение
+    await bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="HTML")
 
 async def notify_channel_about_deal(buyer_id: int, seller_id: int, product: dict):
     """Отправляет информацию о сделке в канал"""
@@ -436,10 +611,16 @@ async def cmd_start(message: Message, state: FSMContext):
     
     balance = await get_user_balance(user_id)
     
-    await message.answer(
+    welcome_text = (
         f"👋 Добро пожаловать, {message.from_user.first_name}!\n\n"
         f"💰 Ваш баланс: {balance:.2f} ₽\n\n"
-        f"Выберите действие:",
+        f"Выберите действие:"
+    )
+    
+    await send_with_image(
+        user_id,
+        welcome_text,
+        image_key="welcome",
         reply_markup=get_main_menu(user_id)
     )
 
@@ -491,7 +672,7 @@ async def process_broadcast_message(message: Message, state: FSMContext):
                 parse_mode="HTML"
             )
             success += 1
-            await asyncio.sleep(0.05)  # Защита от флуда
+            await asyncio.sleep(0.05)
         except Exception as e:
             failed += 1
             logger.error(f"Ошибка отправки пользователю {user['user_id']}: {e}")
@@ -503,6 +684,57 @@ async def process_broadcast_message(message: Message, state: FSMContext):
     )
     
     await state.clear()
+
+@dp.message(Command("setimage"))
+async def set_image_command(message: Message, state: FSMContext):
+    """Команда для установки картинки к уведомлениям (только главный админ)"""
+    if message.from_user.id != MAIN_ADMIN_ID:
+        return
+    
+    await message.answer(
+        "📸 Отправьте фото и укажите ключ через пробел\n\n"
+        "Доступные ключи:\n"
+        "• welcome - приветствие\n"
+        "• deposit - пополнение\n"
+        "• withdrawal - вывод\n"
+        "• deal - сделка\n\n"
+        "Пример: отправьте фото с подписью 'welcome'\n"
+        "/cancel для отмены"
+    )
+    await state.set_state(AdminStates.upload_notification_image)
+
+@dp.message(AdminStates.upload_notification_image, F.photo)
+async def process_notification_image(message: Message, state: FSMContext):
+    """Обработка загрузки картинки для уведомлений"""
+    if not message.caption:
+        await message.answer("❌ Укажите ключ в подписи к фото (welcome, deposit, withdrawal, deal)")
+        return
+    
+    key = message.caption.strip().lower()
+    valid_keys = ['welcome', 'deposit', 'withdrawal', 'deal']
+    
+    if key not in valid_keys:
+        await message.answer(f"❌ Неверный ключ. Используйте: {', '.join(valid_keys)}")
+        return
+    
+    file_id = message.photo[-1].file_id
+    
+    # Загружаем на ImgBB
+    imgbb_url = await upload_photo_to_imgbb(file_id)
+    
+    if imgbb_url:
+        await save_notification_image(key, file_id, imgbb_url)
+        await message.answer(f"✅ Картинка для '{key}' сохранена!\nURL: {imgbb_url}")
+    else:
+        await message.answer("❌ Ошибка загрузки на ImgBB. Проверьте API ключ.")
+    
+    await state.clear()
+
+@dp.message(AdminStates.upload_notification_image, Command("cancel"))
+async def cancel_image_upload(message: Message, state: FSMContext):
+    """Отмена загрузки"""
+    await state.clear()
+    await message.answer("❌ Отменено")
 
 # ================== ОБРАБОТЧИКИ СДЕЛОК ==================
 
@@ -720,6 +952,7 @@ async def process_accept_deal(callback: CallbackQuery):
     active_deals[initiator_id] = {
         "partner_id": partner_id,
         "product": product,
+        "product_id": product_id,
         "confirmed": [],
         "seller_id": initiator_id,
         "buyer_id": partner_id
@@ -727,6 +960,7 @@ async def process_accept_deal(callback: CallbackQuery):
     active_deals[partner_id] = {
         "partner_id": initiator_id,
         "product": product,
+        "product_id": product_id,
         "confirmed": [],
         "seller_id": initiator_id,
         "buyer_id": partner_id
@@ -794,7 +1028,11 @@ async def process_confirm_receipt(callback: CallbackQuery):
     seller_id = deal["seller_id"]
     buyer_id = deal["buyer_id"]
     product = deal["product"]
+    product_id = deal["product_id"]
     price = parse_price(product["price"])
+    
+    # Передаем товар покупателю
+    await transfer_product(product_id, buyer_id)
     
     # Переводим деньги продавцу
     seller_balance = await get_user_balance(seller_id)
@@ -807,6 +1045,7 @@ async def process_confirm_receipt(callback: CallbackQuery):
     del active_deals[buyer_id]
     
     logger.info(f"Сделка завершена: продавец {seller_id} <-> покупатель {buyer_id}, сумма: {price}")
+    logger.info(f"Товар {product_id} передан покупателю {buyer_id}")
     
     # Отправляем в канал
     await notify_channel_about_deal(buyer_id, seller_id, product)
@@ -819,6 +1058,7 @@ async def process_confirm_receipt(callback: CallbackQuery):
             f"✅ Сделка успешно завершена!\n"
             f"💰 +{price:.2f} ₽ к балансу\n"
             f"💳 Ваш баланс: {new_seller_balance:.2f} ₽\n\n"
+            f"📦 Товар передан покупателю!\n"
             f"Покупатель подтвердил получение товара!",
             reply_markup=get_main_menu(seller_id)
         )
@@ -827,8 +1067,46 @@ async def process_confirm_receipt(callback: CallbackQuery):
     
     await callback.message.answer(
         f"✅ Сделка успешно завершена!\n"
-        f"Спасибо за покупку!",
+        f"📦 Товар добавлен в ваш список товаров!\n"
+        f"Проверьте: Мои товары",
         reply_markup=get_main_menu(buyer_id)
+    )
+
+# ================== МОИ ТОВАРЫ ==================
+
+@dp.callback_query(F.data == "my_products")
+async def show_my_products(callback: CallbackQuery):
+    """Показать мои товары"""
+    await callback.answer()
+    
+    user_id = callback.from_user.id
+    products = await get_user_products(user_id)
+    
+    if not products:
+        await callback.message.answer(
+            "📦 У вас пока нет товаров\n\n"
+            "Добавьте товар через меню или купите в сделке!",
+            reply_markup=get_main_menu(user_id)
+        )
+        return
+    
+    text = "📦 <b>Ваши товары:</b>\n\n"
+    
+    for idx, product in enumerate(products, 1):
+        text += f"{idx}. <b>{product['name']}</b>\n"
+        text += f"   💰 Цена: {product['price']}\n"
+        text += f"   📧 Email: {product['email']}\n"
+        text += f"   🔑 Пароль: {product['password']}\n"
+        if product.get('description'):
+            text += f"   📝 Описание: {product['description']}\n"
+        text += "\n"
+    
+    await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
+        ])
     )
 
 # ================== ОБРАБОТЧИКИ ДОБАВЛЕНИЯ ТОВАРА ==================
@@ -1016,37 +1294,204 @@ async def process_deposit(callback: CallbackQuery, state: FSMContext):
     
     balance = await get_user_balance(user_id)
     
-    await callback.message.answer(
+    text = (
         f"💰 Ваш баланс: {balance:.2f} ₽\n\n"
-        f"Выберите способ пополнения:",
+        f"Выберите способ пополнения:"
+    )
+    
+    await send_with_image(
+        user_id,
+        text,
+        image_key="deposit",
         reply_markup=get_deposit_methods_keyboard()
     )
     await state.set_state(DepositStates.selecting_method)
 
-@dp.callback_query(DepositStates.selecting_method, F.data.startswith("deposit_"))
-async def process_deposit_method(callback: CallbackQuery, state: FSMContext):
-    """Выбор метода пополнения"""
+@dp.callback_query(DepositStates.selecting_method, F.data == "deposit_card")
+async def process_deposit_card_start(callback: CallbackQuery, state: FSMContext):
+    """Начало пополнения картой"""
     await callback.answer()
     
-    method = callback.data.replace("deposit_", "").upper()
+    await callback.message.answer(
+        "💰 Введите сумму пополнения (в рублях):"
+    )
+    await state.set_state(DepositStates.waiting_for_amount)
+
+@dp.message(DepositStates.waiting_for_amount)
+async def process_deposit_amount(message: Message, state: FSMContext):
+    """Обработка суммы пополнения"""
+    try:
+        amount = float(message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except:
+        await message.answer("❌ Неверная сумма. Введите число больше 0:")
+        return
     
-    if method == "CARD":
-        method_name = "💳 Карта"
-    elif method == "BTC":
-        method_name = "₿ BTC"
-    elif method == "ETH":
-        method_name = "Ξ ETH"
-    elif method == "USDT":
-        method_name = "₮ USDT"
-    else:
-        method_name = method
+    await state.update_data(amount=amount)
+    
+    # Выбор банка
+    banks = [
+        [InlineKeyboardButton(text="Сбербанк", callback_data="bank_sber")],
+        [InlineKeyboardButton(text="Тинькофф", callback_data="bank_tinkoff")],
+        [InlineKeyboardButton(text="Альфа-Банк", callback_data="bank_alfa")],
+        [InlineKeyboardButton(text="ВТБ", callback_data="bank_vtb")],
+        [InlineKeyboardButton(text="Другой банк", callback_data="bank_other")],
+    ]
+    
+    await message.answer(
+        "🏦 Выберите ваш банк:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=banks)
+    )
+    await state.set_state(DepositStates.selecting_bank)
+
+@dp.callback_query(DepositStates.selecting_bank, F.data.startswith("bank_"))
+async def process_deposit_bank(callback: CallbackQuery, state: FSMContext):
+    """Выбор банка для пополнения"""
+    await callback.answer()
+    
+    bank = callback.data.replace("bank_", "")
+    bank_names = {
+        "sber": "Сбербанк",
+        "tinkoff": "Тинькофф",
+        "alfa": "Альфа-Банк",
+        "vtb": "ВТБ",
+        "other": "Другой банк"
+    }
+    
+    bank_name = bank_names.get(bank, bank)
+    data = await state.get_data()
+    amount = data.get("amount")
+    
+    user_id = callback.from_user.id
+    username = callback.from_user.username or f"user_{user_id}"
+    
+    # Сохраняем запрос
+    await create_payment_request(user_id, 'deposit', {
+        'method': 'CARD',
+        'amount': amount,
+        'bank_name': bank_name
+    })
+    
+    # Уведомляем админов
+    admin_text = (
+        f"💳 <b>Запрос на пополнение (КАРТА)</b>\n\n"
+        f"👤 Пользователь: @{username} (ID: {user_id})\n"
+        f"💰 Сумма: {amount:.2f} ₽\n"
+        f"🏦 Банк: {bank_name}\n"
+        f"⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    )
+    
+    try:
+        await bot.send_message(MAIN_ADMIN_ID, admin_text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка уведомления админа: {e}")
+    
+    # Показываем ожидание
+    await callback.message.answer("⏳ Ожидайте ответа оператора...")
+    await asyncio.sleep(5)
     
     await callback.message.answer(
-        f"⏳ Способ: {method_name}\n\n"
-        f"Свяжитесь с поддержкой для пополнения:\n"
+        f"📩 Ваш запрос отправлен!\n\n"
+        f"Свяжитесь с поддержкой для завершения пополнения:\n"
         f"@{SUPPORT_USERNAME}",
-        reply_markup=get_main_menu(callback.from_user.id)
+        reply_markup=get_main_menu(user_id)
     )
+    
+    await state.clear()
+
+@dp.callback_query(DepositStates.selecting_method, F.data.in_(["deposit_btc", "deposit_eth", "deposit_usdt"]))
+async def process_deposit_crypto_start(callback: CallbackQuery, state: FSMContext):
+    """Начало пополнения криптой"""
+    await callback.answer()
+    
+    crypto = callback.data.replace("deposit_", "").upper()
+    await state.update_data(crypto=crypto)
+    
+    # Выбор сети
+    networks = []
+    if crypto == "USDT":
+        networks = [
+            [InlineKeyboardButton(text="TRC-20 (Tron)", callback_data="network_trc20")],
+            [InlineKeyboardButton(text="ERC-20 (Ethereum)", callback_data="network_erc20")],
+            [InlineKeyboardButton(text="BEP-20 (BSC)", callback_data="network_bep20")],
+        ]
+    elif crypto == "BTC":
+        networks = [
+            [InlineKeyboardButton(text="Bitcoin Network", callback_data="network_btc")],
+        ]
+    elif crypto == "ETH":
+        networks = [
+            [InlineKeyboardButton(text="ERC-20 (Ethereum)", callback_data="network_erc20")],
+        ]
+    
+    networks.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
+    
+    await callback.message.answer(
+        f"Выберите сеть для {crypto}:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=networks)
+    )
+    await state.set_state(DepositStates.selecting_crypto_network)
+
+@dp.callback_query(DepositStates.selecting_crypto_network, F.data.startswith("network_"))
+async def process_deposit_crypto_network(callback: CallbackQuery, state: FSMContext):
+    """Выбор сети крипты для пополнения"""
+    await callback.answer()
+    
+    network = callback.data.replace("network_", "").upper()
+    await state.update_data(network=network)
+    
+    await callback.message.answer(
+        "💰 Введите сумму пополнения (в рублях):"
+    )
+    await state.set_state(DepositStates.waiting_for_crypto_amount)
+
+@dp.message(DepositStates.waiting_for_crypto_amount)
+async def process_deposit_crypto_amount(message: Message, state: FSMContext):
+    """Обработка суммы пополнения криптой"""
+    try:
+        amount = float(message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except:
+        await message.answer("❌ Неверная сумма. Введите число больше 0:")
+        return
+    
+    data = await state.get_data()
+    crypto = data.get("crypto")
+    network = data.get("network")
+    
+    user_id = message.from_user.id
+    username = message.from_user.username or f"user_{user_id}"
+    
+    # Сохраняем запрос
+    await create_payment_request(user_id, 'deposit', {
+        'method': crypto,
+        'amount': amount,
+        'crypto_network': network
+    })
+    
+    # Уведомляем админов
+    admin_text = (
+        f"💳 <b>Запрос на пополнение ({crypto})</b>\n\n"
+        f"👤 Пользователь: @{username} (ID: {user_id})\n"
+        f"💰 Сумма: {amount:.2f} ₽\n"
+        f"🌐 Сеть: {network}\n"
+        f"⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    )
+    
+    try:
+        await bot.send_message(MAIN_ADMIN_ID, admin_text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка уведомления админа: {e}")
+    
+    await message.answer(
+        f"✅ Запрос на пополнение отправлен!\n\n"
+        f"Свяжитесь с поддержкой для получения реквизитов:\n"
+        f"@{SUPPORT_USERNAME}",
+        reply_markup=get_main_menu(user_id)
+    )
+    
     await state.clear()
 
 @dp.callback_query(F.data == "withdrawal")
@@ -1059,23 +1504,172 @@ async def process_withdrawal(callback: CallbackQuery, state: FSMContext):
     
     balance = await get_user_balance(user_id)
     
-    await callback.message.answer(
+    text = (
         f"💰 Ваш баланс: {balance:.2f} ₽\n\n"
-        f"Выберите способ вывода:",
+        f"Выберите способ вывода:"
+    )
+    
+    await send_with_image(
+        user_id,
+        text,
+        image_key="withdrawal",
         reply_markup=get_withdrawal_methods_keyboard()
     )
     await state.set_state(WithdrawalStates.selecting_method)
 
-@dp.callback_query(WithdrawalStates.selecting_method)
-async def process_withdrawal_method(callback: CallbackQuery, state: FSMContext):
-    """Выбор метода вывода"""
+@dp.callback_query(WithdrawalStates.selecting_method, F.data == "withdraw_card")
+async def process_card_withdrawal(callback: CallbackQuery, state: FSMContext):
+    """Обработка вывода на карту"""
     await callback.answer()
     
     await callback.message.answer(
-        f"⏳ Для вывода свяжитесь с поддержкой:\n"
-        f"@{SUPPORT_USERNAME}",
-        reply_markup=get_main_menu(callback.from_user.id)
+        "💳 Введите номер карты для вывода:\n"
+        "(16 цифр без пробелов)"
     )
+    await state.set_state(WithdrawalStates.waiting_for_card)
+
+@dp.message(WithdrawalStates.waiting_for_card)
+async def process_card_number_withdrawal(message: Message, state: FSMContext):
+    """Обработка номера карты для вывода"""
+    card_number = message.text.strip().replace(" ", "")
+    
+    if not card_number.isdigit() or len(card_number) < 16:
+        await message.answer("❌ Неверный формат карты. Введите 16 цифр:")
+        return
+    
+    user_id = message.from_user.id
+    username = message.from_user.username or f"user_{user_id}"
+    balance = await get_user_balance(user_id)
+    
+    # Сохраняем запрос
+    await create_payment_request(user_id, 'withdrawal', {
+        'method': 'CARD',
+        'amount': balance,
+        'card_number': card_number
+    })
+    
+    # Уведомляем админов
+    admin_text = (
+        f"💸 <b>Запрос на вывод (КАРТА)</b>\n\n"
+        f"👤 Пользователь: @{username} (ID: {user_id})\n"
+        f"💰 Сумма: {balance:.2f} ₽\n"
+        f"💳 Карта: {card_number}\n"
+        f"⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    )
+    
+    try:
+        await bot.send_message(MAIN_ADMIN_ID, admin_text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка уведомления админа: {e}")
+    
+    # Показываем ожидание
+    await message.answer("⏳ Обрабатываем ваш запрос...")
+    await asyncio.sleep(30)
+    
+    await message.answer(
+        f"❌ Произошла ошибка при выводе\n\n"
+        f"Напишите в поддержку: @{SUPPORT_USERNAME}",
+        reply_markup=get_main_menu(user_id)
+    )
+    
+    await state.clear()
+
+@dp.callback_query(WithdrawalStates.selecting_method, F.data.in_(["withdraw_btc", "withdraw_eth", "withdraw_usdt"]))
+async def process_crypto_withdrawal_start(callback: CallbackQuery, state: FSMContext):
+    """Начало вывода крипты"""
+    await callback.answer()
+    
+    crypto = callback.data.replace("withdraw_", "").upper()
+    await state.update_data(crypto=crypto)
+    
+    # Выбор сети
+    networks = []
+    if crypto == "USDT":
+        networks = [
+            [InlineKeyboardButton(text="TRC-20 (Tron)", callback_data="network_trc20")],
+            [InlineKeyboardButton(text="ERC-20 (Ethereum)", callback_data="network_erc20")],
+            [InlineKeyboardButton(text="BEP-20 (BSC)", callback_data="network_bep20")],
+        ]
+    elif crypto == "BTC":
+        networks = [
+            [InlineKeyboardButton(text="Bitcoin Network", callback_data="network_btc")],
+        ]
+    elif crypto == "ETH":
+        networks = [
+            [InlineKeyboardButton(text="ERC-20 (Ethereum)", callback_data="network_erc20")],
+        ]
+    
+    networks.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
+    
+    await callback.message.answer(
+        f"Выберите сеть для {crypto}:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=networks)
+    )
+    await state.set_state(WithdrawalStates.selecting_crypto_network)
+
+@dp.callback_query(WithdrawalStates.selecting_crypto_network, F.data.startswith("network_"))
+async def process_crypto_network_withdrawal(callback: CallbackQuery, state: FSMContext):
+    """Выбор сети крипты для вывода"""
+    await callback.answer()
+    
+    network = callback.data.replace("network_", "").upper()
+    await state.update_data(network=network)
+    
+    data = await state.get_data()
+    crypto = data.get("crypto")
+    
+    await callback.message.answer(
+        f"Введите адрес кошелька {crypto} ({network}):"
+    )
+    await state.set_state(WithdrawalStates.waiting_for_crypto_address)
+
+@dp.message(WithdrawalStates.waiting_for_crypto_address)
+async def process_crypto_address_withdrawal(message: Message, state: FSMContext):
+    """Обработка адреса крипты для вывода"""
+    address = message.text.strip()
+    data = await state.get_data()
+    
+    crypto = data.get("crypto")
+    network = data.get("network")
+    user_id = message.from_user.id
+    username = message.from_user.username or f"user_{user_id}"
+    balance = await get_user_balance(user_id)
+    
+    # Сохраняем запрос
+    await create_payment_request(user_id, 'withdrawal', {
+        'method': crypto,
+        'amount': balance,
+        'crypto_network': network,
+        'crypto_address': address
+    })
+    
+    # Уведомляем админов
+    admin_text = (
+        f"💸 <b>Запрос на вывод ({crypto})</b>\n\n"
+        f"👤 Пользователь: @{username} (ID: {user_id})\n"
+        f"💰 Сумма: {balance:.2f} ₽\n"
+        f"🌐 Сеть: {network}\n"
+        f"📍 Адрес: <code>{address}</code>\n"
+        f"⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    )
+    
+    try:
+        await bot.send_message(MAIN_ADMIN_ID, admin_text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка уведомления админа: {e}")
+    
+    await message.answer(
+        f"✅ Запрос на вывод отправлен!\n\n"
+        f"Свяжитесь с поддержкой: @{SUPPORT_USERNAME}",
+        reply_markup=get_main_menu(user_id)
+    )
+    
+    await state.clear()
+
+@dp.callback_query(WithdrawalStates.selecting_method, F.data.in_(["withdraw_cryptobot", "withdraw_stars"]))
+async def process_other_withdrawal(callback: CallbackQuery, state: FSMContext):
+    """Обработка других методов вывода"""
+    await callback.answer("❌ Вывод недоступен", show_alert=True)
     await state.clear()
 
 # ================== ОБРАБОТЧИКИ СООБЩЕНИЙ В СДЕЛКЕ ==================
@@ -1123,7 +1717,11 @@ async def process_admin_panel(callback: CallbackQuery):
         buttons.extend([
             [InlineKeyboardButton(text="👥 Все пользователи", callback_data="admin_all_users")],
             [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="📸 Установить картинки", callback_data="admin_set_images")],
         ])
+    else:
+        # Для доп админов показываем пользователей с кем были сделки
+        buttons.append([InlineKeyboardButton(text="👥 Мои пользователи", callback_data="admin_my_users")])
     
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
     
@@ -1131,6 +1729,78 @@ async def process_admin_panel(callback: CallbackQuery):
         "🛠 <b>Админ-панель</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+@dp.callback_query(F.data == "admin_my_users")
+async def process_admin_my_users(callback: CallbackQuery):
+    """Пользователи с кем были сделки (для доп админов)"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    admin_id = callback.from_user.id
+    user_ids = await get_users_with_deals(admin_id)
+    
+    if not user_ids:
+        await callback.message.answer(
+            "📊 У вас пока нет пользователей\n\n"
+            "Пользователи появятся после первой сделки",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")]
+            ])
+        )
+        return
+    
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch(
+            'SELECT * FROM users WHERE user_id = ANY($1)',
+            user_ids
+        )
+    
+    buttons = []
+    for user in users:
+        username = user['username'] or f"user_{user['user_id']}"
+        balance = float(user['balance'])
+        
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"@{username} | 💰{balance:.2f}₽",
+                callback_data=f"admin_user:{user['user_id']}"
+            )
+        ])
+    
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")])
+    
+    await callback.message.answer(
+        f"👥 <b>Ваши пользователи: {len(users)}</b>\n"
+        f"(только те, с кем были сделки)",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+@dp.callback_query(F.data == "admin_set_images")
+async def admin_set_images_info(callback: CallbackQuery):
+    """Информация об установке картинок"""
+    await callback.answer()
+    
+    await callback.message.answer(
+        "📸 <b>Установка картинок для уведомлений</b>\n\n"
+        "Используйте команду /setimage\n\n"
+        "Доступные ключи:\n"
+        "• welcome - приветствие при /start\n"
+        "• deposit - пополнение баланса\n"
+        "• withdrawal - вывод средств\n"
+        "• deal - начало сделки\n\n"
+        "Пример:\n"
+        "1. Отправьте /setimage\n"
+        "2. Отправьте фото с подписью 'welcome'\n"
+        "3. Картинка загрузится на ImgBB",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")]
+        ])
     )
 
 @dp.callback_query(F.data == "admin_broadcast")
@@ -1168,7 +1838,7 @@ async def process_admin_all_users(callback: CallbackQuery):
         return
     
     buttons = []
-    for user in users[:50]:  # Показываем первых 50
+    for user in users[:50]:
         username = user['username'] or f"user_{user['user_id']}"
         balance = float(user['balance'])
         
@@ -1208,17 +1878,39 @@ async def process_admin_user_details(callback: CallbackQuery, state: FSMContext)
         
         products = await get_user_products(user_id)
         messages = await get_user_messages(user_id)
+        requests = await get_user_payment_requests(user_id)
     
     info = f"👤 <b>Пользователь:</b> @{user['username'] or f'user_{user_id}'}\n"
-    info += f"🆔 <b>ID:</b> {user_id}\n"
+    info += f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
     info += f"💰 <b>Баланс:</b> {float(user['balance']):.2f} ₽\n"
     info += f"✅ <b>Сделок:</b> {user['deals_completed']}\n"
     info += f"📦 <b>Товаров:</b> {len(products)}\n"
     info += f"💬 <b>Сообщений:</b> {len(messages)}\n"
+    info += f"📋 <b>Запросов пополнения/вывода:</b> {len(requests)}\n\n"
+    
+    # Показываем последние запросы
+    if requests:
+        info += "<b>📋 Последние запросы:</b>\n"
+        for req in requests[:5]:
+            req_type = "💳 Пополнение" if req['request_type'] == 'deposit' else "💸 Вывод"
+            method = req['method']
+            amount = float(req['amount']) if req['amount'] else 0
+            time_str = req['created_at'].strftime('%d.%m %H:%M') if req['created_at'] else ''
+            
+            info += f"{req_type} {method} - {amount:.2f}₽ ({time_str})\n"
+            
+            if req['bank_name']:
+                info += f"   🏦 {req['bank_name']}\n"
+            if req['crypto_network']:
+                info += f"   🌐 {req['crypto_network']}\n"
+            if req['card_number']:
+                info += f"   💳 {req['card_number']}\n"
+            if req['crypto_address']:
+                info += f"   📍 <code>{req['crypto_address'][:20]}...</code>\n"
     
     buttons = [
         [InlineKeyboardButton(text="✉️ Написать", callback_data=f"admin_reply:{user_id}")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_all_users")]
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_all_users" if is_main_admin(callback.from_user.id) else "admin_my_users")]
     ]
     
     await callback.message.answer(
@@ -1316,7 +2008,7 @@ async def process_back_to_menu(callback: CallbackQuery, state: FSMContext):
 async def cleanup_messages_task():
     """Очистка старых сообщений"""
     while True:
-        await asyncio.sleep(3600)  # Каждый час
+        await asyncio.sleep(3600)
         await cleanup_old_messages()
 
 # ================== ЗАПУСК БОТА ==================
@@ -1335,6 +2027,11 @@ async def main():
     
     if DEALS_CHANNEL_ID:
         logger.info(f"Канал для сделок: {DEALS_CHANNEL_ID}")
+    
+    if IMGBB_API_KEY:
+        logger.info("ImgBB API ключ установлен")
+    else:
+        logger.warning("ImgBB API ключ не установлен - картинки в уведомлениях работать не будут")
     
     # Удаляем webhook
     await bot.delete_webhook(drop_pending_updates=True)
