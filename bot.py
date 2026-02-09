@@ -1194,15 +1194,32 @@ async def show_my_products(callback: CallbackQuery):
     for idx, product in enumerate(products, 1):
         # Определяем статус товара
         status = "🛒 Куплен" if product.get('is_sold') else "📝 Мой"
+        category = product.get('category', '')
         
         text += f"{idx}. <b>{product['name']}</b> {status}\n"
         text += f"   💰 Цена: {product['price']}\n"
-        text += f"   📧 Email: {product['email']}\n"
-        text += f"   🔑 Пароль: {product['password']}\n"
-        if product.get('trophies'):
+        
+        # Для NFT, STARS, STANDOFF 2 не показываем email/пароль
+        if category not in ["NFT", "STARS", "STANDOFF"]:
+            text += f"   📧 Email: {product['email']}\n"
+            text += f"   🔑 Пароль: {product['password']}\n"
+        
+        # Для NFT показываем ссылку
+        if category == "NFT":
+            text += f"   🔗 Ссылка: {product['email']}\n"
+        
+        # Для STARS показываем количество
+        if category == "STARS" and product.get('trophies'):
+            text += f"   ⭐ Количество: {product['trophies']} звёзд\n"
+        
+        # Для SUPERCELL показываем кубки
+        if category == "SUPERCELL" and product.get('trophies'):
             text += f"   🏆 Кубки: {product['trophies']}\n"
+        
+        # Описание показываем всегда если есть
         if product.get('description'):
             text += f"   📝 Описание: {product['description']}\n"
+        
         text += "\n"
     
     await callback.message.answer(
