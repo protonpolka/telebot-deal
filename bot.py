@@ -199,11 +199,43 @@ async def update_balance(user_id: int, amount: float):
         )
 
 async def get_user_products(user_id: int) -> List[dict]:
-    """Получает все товары пользователя (только не проданные и принадлежащие ему)"""
+    """Получает все товары пользователя (принадлежащие ему, независимо от статуса продажи)"""
     async with db_pool.acquire() as conn:
         products = await conn.fetch(
             '''SELECT * FROM products 
-               WHERE owner_id = $1 AND is_sold = FALSE 
+               WHERE owner_id = $1
+               ORDER BY created_at DESC''',
+            user_id
+        )
+        
+        result = []
+        for product in products:
+            screenshots = await conn.fetch(
+                'SELECT file_id FROM screenshots WHERE product_id = $1',
+                product['id']
+            )
+            
+            result.append({
+                'id': product['id'],
+                'name': product['name'],
+                'category': product['category'],
+                'email': product['email'],
+                'password': product['password'],
+                'price': product['price'],
+                'trophies': product['trophies'],
+                'description': product['description'],
+                'screenshots': [s['file_id'] for s in screenshots],
+                'is_sold': product['is_sold']
+            })
+        
+        return result
+
+async def get_user_products_for_sale(user_id: int) -> List[dict]:
+    """Получает товары пользователя доступные для продажи (не проданные)"""
+    async with db_pool.acquire() as conn:
+        products = await conn.fetch(
+            '''SELECT * FROM products 
+               WHERE owner_id = $1 AND is_sold = FALSE
                ORDER BY created_at DESC''',
             user_id
         )
@@ -416,12 +448,16 @@ class DealStates(StatesGroup):
 
 class ProductStates(StatesGroup):
     selecting_category = State()
+    selecting_supercell_type = State()
     waiting_for_email = State()
     waiting_for_password = State()
     waiting_for_trophies = State()
     waiting_for_description = State()
     waiting_for_price = State()
     waiting_for_screenshots = State()
+    waiting_for_nft_link = State()
+    waiting_for_stars_amount = State()
+    waiting_for_product_description = State()
 
 class WithdrawalStates(StatesGroup):
     selecting_method = State()
@@ -528,6 +564,7 @@ def get_product_categories_keyboard():
         [InlineKeyboardButton(text="🎮 SUPERCELL", callback_data="cat_supercell")],
         [InlineKeyboardButton(text="🔥 FREE FIRE", callback_data="cat_freefire")],
         [InlineKeyboardButton(text="🎯 PUBG MOBILE", callback_data="cat_pubg")],
+        [InlineKeyboardButton(text="🔫 STANDOFF 2", callback_data="cat_standoff")],
         [InlineKeyboardButton(text="🎨 NFT GIFT", callback_data="cat_nft")],
         [InlineKeyboardButton(text="⭐️ TELEGRAM STARS", callback_data="cat_stars")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
@@ -750,7 +787,7 @@ async def process_deal_button(callback: CallbackQuery, state: FSMContext):
         return
     
     await ensure_user_exists(user_id, callback.from_user.username)
-    products = await get_user_products(user_id)
+    products = await get_user_products_for_sale(user_id)  # Только не проданные
     
     if not products:
         await callback.message.answer(
@@ -801,7 +838,7 @@ async def process_partner_username(message: Message, state: FSMContext):
     
     await state.update_data(partner_id=partner_id, partner_username=partner_username)
     
-    products = await get_user_products(user_id)
+    products = await get_user_products_for_sale(user_id)  # Только не проданные
     buttons = []
     
     for idx, product in enumerate(products):
@@ -832,7 +869,7 @@ async def process_product_selection(callback: CallbackQuery, state: FSMContext):
     partner_id = data["partner_id"]
     partner_username = data["partner_username"]
     
-    products = await get_user_products(user_id)
+    products = await get_user_products_for_sale(user_id)  # Только не проданные
     product = next((p for p in products if p['id'] == product_id), None)
     
     if not product:
@@ -973,7 +1010,11 @@ async def process_accept_deal(callback: CallbackQuery):
     new_balance = await get_user_balance(partner_id)
     
     deal_text_buyer = (
-        f"✅ Сделка начата!\n\n"
+        f"✅ <b>Сделка начата!</b>\n\n"
+        f"⚠️ <b>ВАЖНО!</b> ⚠️\n"
+        f"🔴 Общайтесь ТОЛЬКО в боте Playerok!\n"
+        f"🔴 НЕ переходите в личные сообщения!\n"
+        f"🔴 Подтверждайте получение ТОЛЬКО после полной проверки товара!\n\n"
         f"📦 Товар: {product['name']}\n"
         f"💰 Цена: {product['price']}\n"
         f"💳 Списано с баланса: {price:.2f} ₽\n"
@@ -984,11 +1025,15 @@ async def process_accept_deal(callback: CallbackQuery):
     
     await callback.message.answer(
         deal_text_buyer,
-        reply_markup=get_chat_keyboard(is_buyer=True)
+        reply_markup=get_chat_keyboard(is_buyer=True),
+        parse_mode="HTML"
     )
     
     deal_text_seller = (
-        f"✅ Сделка начата!\n\n"
+        f"✅ <b>Сделка начата!</b>\n\n"
+        f"⚠️ <b>ВАЖНО!</b> ⚠️\n"
+        f"🔴 Общайтесь ТОЛЬКО в боте Playerok!\n"
+        f"🔴 НЕ переходите в личные сообщения!\n\n"
         f"📦 Товар: {product['name']}\n"
         f"💰 Цена: {product['price']}\n"
         f"🔒 Средства заморожены до подтверждения покупателем\n\n"
@@ -1000,7 +1045,8 @@ async def process_accept_deal(callback: CallbackQuery):
         await bot.send_message(
             initiator_id,
             deal_text_seller,
-            reply_markup=get_chat_keyboard(is_buyer=False)
+            reply_markup=get_chat_keyboard(is_buyer=False),
+            parse_mode="HTML"
         )
     except Exception as e:
         logger.error(f"Ошибка уведомления продавца: {e}")
@@ -1025,18 +1071,69 @@ async def process_confirm_receipt(callback: CallbackQuery):
         await callback.answer("❌ Только покупатель может подтвердить получение", show_alert=True)
         return
     
+    # Показываем предупреждение
+    warning_text = (
+        f"⚠️ <b>ВНИМАНИЕ!</b> ⚠️\n\n"
+        f"Подтверждайте получение товара ТОЛЬКО если:\n\n"
+        f"✅ Вы ПОЛУЧИЛИ товар\n"
+        f"✅ Вы ПРОВЕРИЛИ все данные\n"
+        f"✅ Товар СООТВЕТСТВУЕТ описанию\n"
+        f"✅ Вы можете ВОЙТИ в аккаунт\n\n"
+        f"❌ После подтверждения деньги уйдут продавцу!\n"
+        f"❌ Отменить операцию будет НЕВОЗМОЖНО!\n\n"
+        f"Вы уверены что хотите подтвердить?"
+    )
+    
+    buttons = [
+        [InlineKeyboardButton(text="✅ Да, подтверждаю", callback_data="final_confirm_receipt")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_confirm")]
+    ]
+    
+    await callback.message.answer(
+        warning_text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+@dp.callback_query(F.data == "cancel_confirm")
+async def cancel_confirmation(callback: CallbackQuery):
+    """Отмена подтверждения"""
+    await callback.answer("Отменено")
+    await callback.message.delete()
+
+@dp.callback_query(F.data == "final_confirm_receipt")
+async def final_confirm_receipt(callback: CallbackQuery):
+    """Финальное подтверждение получения товара"""
+    await callback.answer()
+    
+    user_id = callback.from_user.id
+    
+    if user_id not in active_deals:
+        await callback.message.answer(
+            "❌ У вас нет активной сделки",
+            reply_markup=get_main_menu(user_id)
+        )
+        return
+    
+    deal = active_deals[user_id]
+    
     seller_id = deal["seller_id"]
     buyer_id = deal["buyer_id"]
     product = deal["product"]
     product_id = deal["product_id"]
     price = parse_price(product["price"])
     
+    # Считаем комиссию платформы (5%)
+    PLATFORM_FEE = 0.05
+    seller_amount = price * (1 - PLATFORM_FEE)
+    platform_fee = price * PLATFORM_FEE
+    
     # Передаем товар покупателю
     await transfer_product(product_id, buyer_id)
     
-    # Переводим деньги продавцу
+    # Переводим деньги продавцу (с вычетом комиссии)
     seller_balance = await get_user_balance(seller_id)
-    await update_balance(seller_id, seller_balance + price)
+    await update_balance(seller_id, seller_balance + seller_amount)
     await increment_deals(seller_id)
     await increment_deals(buyer_id)
     
@@ -1056,8 +1153,10 @@ async def process_confirm_receipt(callback: CallbackQuery):
         await bot.send_message(
             seller_id,
             f"✅ Сделка успешно завершена!\n"
-            f"💰 +{price:.2f} ₽ к балансу\n"
-            f"💳 Ваш баланс: {new_seller_balance:.2f} ₽\n\n"
+            f"💰 Цена товара: {price:.2f} ₽\n"
+            f"📊 Комиссия платформы (5%): -{platform_fee:.2f} ₽\n"
+            f"💵 Вы получили: +{seller_amount:.2f} ₽\n"
+            f"💳 Новый баланс: {new_seller_balance:.2f} ₽\n\n"
             f"📦 Товар передан покупателю!\n"
             f"Покупатель подтвердил получение товара!",
             reply_markup=get_main_menu(seller_id)
@@ -1080,7 +1179,7 @@ async def show_my_products(callback: CallbackQuery):
     await callback.answer()
     
     user_id = callback.from_user.id
-    products = await get_user_products(user_id)
+    products = await get_user_products(user_id)  # ВСЕ товары
     
     if not products:
         await callback.message.answer(
@@ -1093,10 +1192,15 @@ async def show_my_products(callback: CallbackQuery):
     text = "📦 <b>Ваши товары:</b>\n\n"
     
     for idx, product in enumerate(products, 1):
-        text += f"{idx}. <b>{product['name']}</b>\n"
+        # Определяем статус товара
+        status = "🛒 Куплен" if product.get('is_sold') else "📝 Мой"
+        
+        text += f"{idx}. <b>{product['name']}</b> {status}\n"
         text += f"   💰 Цена: {product['price']}\n"
         text += f"   📧 Email: {product['email']}\n"
         text += f"   🔑 Пароль: {product['password']}\n"
+        if product.get('trophies'):
+            text += f"   🏆 Кубки: {product['trophies']}\n"
         if product.get('description'):
             text += f"   📝 Описание: {product['description']}\n"
         text += "\n"
@@ -1132,16 +1236,68 @@ async def process_category_selection(callback: CallbackQuery, state: FSMContext)
     await state.update_data(category=category)
     
     if category == "SUPERCELL":
+        # Выбор типа аккаунта - Перепривязка или Почта
+        buttons = [
+            [InlineKeyboardButton(text="🔄 Перепривязка (ПП)", callback_data="supercell_pp")],
+            [InlineKeyboardButton(text="📧 Почта + Пароль", callback_data="supercell_email")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
+        ]
+        
         await callback.message.answer(
             "🎮 <b>SUPERCELL</b>\n\n"
+            "Выберите тип аккаунта:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+        await state.set_state(ProductStates.selecting_supercell_type)
+        
+    elif category == "NFT":
+        await callback.message.answer(
+            "🎨 <b>NFT GIFT</b>\n\n"
+            "📎 Отправьте ссылку на NFT:",
+            parse_mode="HTML"
+        )
+        await state.set_state(ProductStates.waiting_for_nft_link)
+        
+    elif category == "STARS":
+        await callback.message.answer(
+            "⭐️ <b>TELEGRAM STARS</b>\n\n"
+            "✨ Введите количество звёзд:",
+            parse_mode="HTML"
+        )
+        await state.set_state(ProductStates.waiting_for_stars_amount)
+        
+    else:
+        # Для остальных категорий (FREE FIRE, PUBG, STANDOFF 2)
+        await callback.message.answer(
+            f"📝 Опишите что вы продаёте:\n"
+            f"(подробно опишите товар)"
+        )
+        await state.set_state(ProductStates.waiting_for_product_description)
+
+@dp.callback_query(ProductStates.selecting_supercell_type)
+async def process_supercell_type(callback: CallbackQuery, state: FSMContext):
+    """Обработка типа SUPERCELL аккаунта"""
+    await callback.answer()
+    
+    if callback.data == "supercell_pp":
+        # Перепривязка - сразу скриншоты
+        await state.update_data(account_type="pp", email="ПП", password="ПП")
+        await callback.message.answer(
+            "🔄 <b>Перепривязка</b>\n\n"
             "Отправьте скриншоты аккаунта.\n"
-            "Когда закончите, введите команду /done",
+            "Когда закончите, введите /done",
             parse_mode="HTML"
         )
         await state.update_data(screenshots=[])
         await state.set_state(ProductStates.waiting_for_screenshots)
-    else:
-        await callback.message.answer("📧 Введите email (почту) товара:")
+        
+    elif callback.data == "supercell_email":
+        # Почта - запрашиваем email и пароль
+        await state.update_data(account_type="email")
+        await callback.message.answer(
+            "📧 Введите email (почту) аккаунта:"
+        )
         await state.set_state(ProductStates.waiting_for_email)
 
 @dp.message(ProductStates.waiting_for_screenshots, F.photo)
@@ -1164,8 +1320,56 @@ async def finish_screenshots(message: Message, state: FSMContext):
         await message.answer("❌ Нужно добавить хотя бы один скриншот!")
         return
     
-    await message.answer("📧 Введите email (почту) аккаунта:")
-    await state.set_state(ProductStates.waiting_for_email)
+    category = data.get("category")
+    
+    # Для SUPERCELL с перепривязкой
+    if category == "SUPERCELL" and data.get("account_type") == "pp":
+        await message.answer("🏆 Введите количество кубков:")
+        await state.set_state(ProductStates.waiting_for_trophies)
+    # Для SUPERCELL с почтой
+    elif category == "SUPERCELL":
+        await message.answer("📧 Введите email (почту) аккаунта:")
+        await state.set_state(ProductStates.waiting_for_email)
+    else:
+        # Для остальных категорий
+        await message.answer("📧 Введите email (почту) аккаунта:")
+        await state.set_state(ProductStates.waiting_for_email)
+
+@dp.message(ProductStates.waiting_for_nft_link)
+async def process_nft_link(message: Message, state: FSMContext):
+    """Обработка ссылки на NFT"""
+    nft_link = message.text.strip()
+    await state.update_data(email=nft_link, password="NFT", description=f"Ссылка: {nft_link}")
+    
+    await message.answer("💰 Введите цену товара (в рублях):")
+    await state.set_state(ProductStates.waiting_for_price)
+
+@dp.message(ProductStates.waiting_for_stars_amount)
+async def process_stars_amount(message: Message, state: FSMContext):
+    """Обработка количества звёзд"""
+    stars_amount = message.text.strip()
+    await state.update_data(
+        email=f"{stars_amount} звёзд", 
+        password="STARS",
+        trophies=stars_amount,
+        description=f"Количество: {stars_amount} звёзд"
+    )
+    
+    await message.answer("💰 Введите цену товара (в рублях):")
+    await state.set_state(ProductStates.waiting_for_price)
+
+@dp.message(ProductStates.waiting_for_product_description)
+async def process_product_general_description(message: Message, state: FSMContext):
+    """Обработка общего описания товара"""
+    description = message.text.strip()
+    await state.update_data(
+        email="Описание ниже",
+        password="-",
+        description=description
+    )
+    
+    await message.answer("💰 Введите цену товара (в рублях):")
+    await state.set_state(ProductStates.waiting_for_price)
 
 @dp.message(ProductStates.waiting_for_email)
 async def process_product_email(message: Message, state: FSMContext):
@@ -1220,13 +1424,34 @@ async def process_product_description(message: Message, state: FSMContext):
 @dp.message(ProductStates.waiting_for_price)
 async def process_product_price(message: Message, state: FSMContext):
     """Обработка цены"""
-    price = message.text.strip()
-    await state.update_data(price=price)
+    price_text = message.text.strip()
+    
+    try:
+        price = parse_price(price_text)
+        if price <= 0:
+            raise ValueError
+    except:
+        await message.answer("❌ Неверная цена. Введите число больше 0:")
+        return
+    
+    # Считаем комиссию платформы (5%)
+    PLATFORM_FEE = 0.05  # 5%
+    seller_amount = price * (1 - PLATFORM_FEE)
+    
+    await state.update_data(price=f"{price:.0f} ₽")
+    
+    # Показываем что продавец получит
+    await message.answer(
+        f"💰 <b>Цена установлена: {price:.0f} ₽</b>\n\n"
+        f"💵 Вы получите: <b>{seller_amount:.0f} ₽</b>\n"
+        f"📊 Комиссия платформы: <b>5%</b> ({price * PLATFORM_FEE:.0f} ₽)",
+        parse_mode="HTML"
+    )
     
     data = await state.get_data()
     category = data.get("category")
     
-    if category != "SUPERCELL":
+    if category != "SUPERCELL" and not data.get("screenshots"):
         await message.answer(
             "📸 Отправьте скриншоты товара (фото).\n"
             "Когда закончите, отправьте команду /done"
@@ -1669,7 +1894,16 @@ async def process_crypto_address_withdrawal(message: Message, state: FSMContext)
 @dp.callback_query(WithdrawalStates.selecting_method, F.data.in_(["withdraw_cryptobot", "withdraw_stars"]))
 async def process_other_withdrawal(callback: CallbackQuery, state: FSMContext):
     """Обработка других методов вывода"""
-    await callback.answer("❌ Вывод недоступен", show_alert=True)
+    await callback.answer()
+    
+    method = "CryptoBot" if callback.data == "withdraw_cryptobot" else "Telegram Stars"
+    user_id = callback.from_user.id
+    
+    await callback.message.answer(
+        f"⏳ Для вывода через {method}\n\n"
+        f"Свяжитесь с поддержкой: @{SUPPORT_USERNAME}",
+        reply_markup=get_main_menu(user_id)
+    )
     await state.clear()
 
 # ================== ОБРАБОТЧИКИ СООБЩЕНИЙ В СДЕЛКЕ ==================
