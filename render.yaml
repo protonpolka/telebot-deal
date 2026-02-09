@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: telegram-deals-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: telegram-deals-db
+          property: connectionString
+      - key: MAIN_ADMIN_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DEALS_CHANNEL_ID
+        sync: false
+      - key: SUPPORT_USERNAME
+        sync: false
+
+databases:
+  - name: telegram-deals-db
+    databaseName: telegram_deals
+    user: telegram_bot
