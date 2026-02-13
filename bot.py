@@ -784,8 +784,122 @@ async def add_balance_command(message: Message):
         user_id = int(args[1])
         amount = float(args[2])
         await add_balance(user_id, amount)
+        await message.answer(f"✅ Добавлено {amount}₽ пользователю {user_id}")
     except:
-        pass
+        await message.answer(
+            "Использование: /addbalance USER_ID AMOUNT\n"
+            "Пример: /addbalance 123456789 1000"
+        )
+
+@dp.message(Command("addadmin"))
+async def add_admin_command(message: Message):
+    """Команда добавления админа (только главный админ)"""
+    if message.from_user.id != MAIN_ADMIN_ID:
+        return
+    
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "📝 <b>Использование:</b>\n\n"
+            "/addadmin USER_ID - обычный админ\n"
+            "/addadmin USER_ID super - главный админ\n\n"
+            "Примеры:\n"
+            "/addadmin 123456789\n"
+            "/addadmin 987654321 super",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        user_id = int(parts[1])
+    except:
+        await message.answer("❌ Неверный ID")
+        return
+    
+    is_super = len(parts) > 2 and parts[2].lower() == "super"
+    
+    # Проверяем что пользователь существует
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow('SELECT username FROM users WHERE user_id = $1', user_id)
+    
+    if not user:
+        await message.answer(
+            f"❌ Пользователь {user_id} не найден!\n"
+            f"Попросите его написать /start"
+        )
+        return
+    
+    username = user['username'] or f"user_{user_id}"
+    
+    try:
+        await add_admin_to_db(user_id, username, message.from_user.id, is_super)
+        
+        admin_type = "👑 Главный" if is_super else "👤 Обычный"
+        
+        # Уведомляем
+        try:
+            await bot.send_message(
+                user_id,
+                f"🎉 Вы назначены {'главным ' if is_super else ''}администратором!\n"
+                f"Нажмите /start",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+        
+        await message.answer(
+            f"✅ <b>Админ добавлен!</b>\n\n"
+            f"@{username} ({user_id})\n"
+            f"Тип: {admin_type}",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(Command("removeadmin"))
+async def remove_admin_command(message: Message):
+    """Удаление админа"""
+    if message.from_user.id != MAIN_ADMIN_ID:
+        return
+    
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /removeadmin USER_ID")
+        return
+    
+    try:
+        user_id = int(parts[1])
+        await remove_admin_from_db(user_id)
+        await message.answer(f"✅ Админ {user_id} удалён")
+    except:
+        await message.answer("❌ Ошибка")
+
+@dp.message(Command("listadmins"))
+async def list_admins_command(message: Message):
+    """Список всех админов"""
+    if message.from_user.id != MAIN_ADMIN_ID:
+        return
+    
+    db_admins = await get_all_admins_from_db()
+    
+    text = "👑 <b>Все админы:</b>\n\n"
+    text += f"👑 Главный (env): <code>{MAIN_ADMIN_ID}</code>\n\n"
+    
+    if ADMIN_IDS:
+        text += "📋 Админы (env):\n"
+        for aid in ADMIN_IDS:
+            text += f"<code>{aid}</code>\n"
+        text += "\n"
+    
+    if db_admins:
+        text += "🎖 Админы (БД):\n"
+        for admin in db_admins:
+            username = admin['username'] or f"user_{admin['user_id']}"
+            t = "👑" if admin.get('is_super') else "👤"
+            text += f"{t} @{username} - <code>{admin['user_id']}</code>\n"
+    
+    await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("broadcast"))
 async def broadcast_command(message: Message, state: FSMContext):
