@@ -728,11 +728,13 @@ async def cmd_start(message: Message, state: FSMContext):
         f"Выберите действие:"
     )
     
+    menu = await get_main_menu_async(user_id)
+    
     await send_with_image(
         user_id,
         welcome_text,
         image_key="welcome",
-        reply_markup=get_main_menu(user_id)
+        reply_markup=menu
     )
 
 @dp.message(Command("addbalance"))
@@ -2263,15 +2265,19 @@ async def admin_add_admin_process(message: Message, state: FSMContext):
             user_id,
             "🎉 <b>Поздравляем!</b>\n\n"
             "Вам назначены права администратора!\n"
-            "Теперь у вас есть доступ к админ-панели.",
-            parse_mode="HTML",
-            reply_markup=get_main_menu(user_id)
+            "Теперь у вас есть доступ к админ-панели.\n\n"
+            "Нажмите /start чтобы увидеть кнопку 'Админ панель'",
+            parse_mode="HTML"
         )
-    except:
-        pass
+    except Exception as e:
+        logger.error(f"Ошибка уведомления нового админа: {e}")
     
     await message.answer(
-        f"✅ Пользователь @{username} назначен админом!",
+        f"✅ <b>Админ успешно назначен!</b>\n\n"
+        f"👤 Пользователь: @{username}\n"
+        f"🆔 ID: {user_id}\n\n"
+        f"Пользователь получил права администратора!",
+        parse_mode="HTML",
         reply_markup=get_main_menu(message.from_user.id)
     )
     await state.clear()
@@ -2672,10 +2678,12 @@ async def process_back_to_menu(callback: CallbackQuery, state: FSMContext):
     await ensure_user_exists(user_id, callback.from_user.username)
     balance = await get_user_balance(user_id)
     
+    menu = await get_main_menu_async(user_id)
+    
     await callback.message.answer(
         f"💰 Баланс: {balance:.2f} ₽\n\n"
         f"Главное меню:",
-        reply_markup=get_main_menu(user_id)
+        reply_markup=menu
     )
 
 # ================== ФОНОВЫЕ ЗАДАЧИ ==================
