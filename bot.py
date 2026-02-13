@@ -144,6 +144,16 @@ async def init_db():
                 )
             ''')
             
+            # Таблица админов
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS admins (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    added_by BIGINT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
             # Индексы для оптимизации
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at)')
@@ -403,6 +413,45 @@ async def get_users_with_deals(admin_id: int) -> List[int]:
         )
         return [u['user_id'] for u in users if u['user_id'] != admin_id]
 
+async def add_admin_to_db(user_id: int, username: str, added_by: int):
+    """Добавляет админа в базу данных"""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''INSERT INTO admins (user_id, username, added_by) 
+               VALUES ($1, $2, $3)
+               ON CONFLICT (user_id) DO NOTHING''',
+            user_id, username, added_by
+        )
+        logger.info(f"Админ добавлен: {user_id} (@{username}) добавил {added_by}")
+
+async def remove_admin_from_db(user_id: int):
+    """Удаляет админа из базы данных"""
+    async with db_pool.acquire() as conn:
+        await conn.execute('DELETE FROM admins WHERE user_id = $1', user_id)
+        logger.info(f"Админ удален: {user_id}")
+
+async def get_all_admins_from_db() -> List[dict]:
+    """Получает всех админов из базы данных"""
+    async with db_pool.acquire() as conn:
+        admins = await conn.fetch('SELECT * FROM admins ORDER BY created_at DESC')
+        return [dict(a) for a in admins]
+
+async def is_admin_in_db(user_id: int) -> bool:
+    """Проверяет является ли пользователь админом в БД"""
+    async with db_pool.acquire() as conn:
+        result = await conn.fetchval('SELECT user_id FROM admins WHERE user_id = $1', user_id)
+        return result is not None
+
+def is_admin(user_id: int) -> bool:
+    """Проверяет является ли пользователь админом (включая главного)"""
+    return user_id == MAIN_ADMIN_ID or user_id in ADMIN_IDS
+
+async def is_admin_async(user_id: int) -> bool:
+    """Асинхронная проверка админа (с проверкой БД)"""
+    if user_id == MAIN_ADMIN_ID or user_id in ADMIN_IDS:
+        return True
+    return await is_admin_in_db(user_id)
+
 # ================== IMGBB ФУНКЦИИ ==================
 
 async def upload_photo_to_imgbb(file_id: str) -> Optional[str]:
@@ -477,6 +526,8 @@ class AdminStates(StatesGroup):
     replying_to_user = State()
     broadcast_message = State()
     upload_notification_image = State()
+    adding_admin = State()
+    adding_balance_to_admin = State()
 
 # ================== ИНИЦИАЛИЗАЦИЯ БОТА ==================
 
@@ -505,6 +556,23 @@ def parse_price(price_str: str) -> float:
         return float(clean_price) if clean_price else 0.0
     except:
         return 0.0
+
+async def get_main_menu_async(user_id: int = None):
+    """Главное меню (асинхронная версия для проверки БД)"""
+    buttons = [
+        [InlineKeyboardButton(text="🧾 Сделка", callback_data="deal")],
+        [InlineKeyboardButton(text="📋 Активные сделки", callback_data="active_deals")],
+        [InlineKeyboardButton(text="💳 Пополнить", callback_data="deposit")],
+        [InlineKeyboardButton(text="💸 Вывод", callback_data="withdrawal")],
+        [InlineKeyboardButton(text="➕ Добавить товар", callback_data="add_product")],
+        [InlineKeyboardButton(text="📦 Мои товары", callback_data="my_products")],
+        [InlineKeyboardButton(text="👥 Реферальная система", callback_data="referral")]
+    ]
+    
+    if user_id and await is_admin_async(user_id):
+        buttons.append([InlineKeyboardButton(text="🛠 Админ панель", callback_data="admin_panel")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_main_menu(user_id: int = None):
     """Главное меню"""
@@ -919,10 +987,12 @@ async def process_partner_username(message: Message, state: FSMContext):
         return
     
     # Проверка: если пользователь НЕ админ, то партнер ДОЛЖЕН быть админом
-    if not is_admin(user_id) and not is_admin(partner_id):
+    user_is_admin = await is_admin_async(user_id)
+    partner_is_admin = await is_admin_async(partner_id)
+    
+    if not user_is_admin and not partner_is_admin:
         await message.answer(
-            "❌ Вы можете создавать сделки только с администраторами!\n"
-            f"Пользователь @{partner_username} не является администратором.",
+            "❌ Не удалось создать сделку с этим пользователем",
             reply_markup=get_main_menu(user_id)
         )
         await state.clear()
@@ -1993,7 +2063,10 @@ async def process_card_number_withdrawal(message: Message, state: FSMContext):
 @dp.callback_query(WithdrawalStates.selecting_method, F.data.in_(["withdraw_btc", "withdraw_eth", "withdraw_usdt", "withdraw_cryptobot", "withdraw_stars"]))
 async def process_unavailable_withdrawal(callback: CallbackQuery, state: FSMContext):
     """Недоступные методы вывода"""
-    await callback.answer("❌ Вывод недоступен. Доступны только карты.", show_alert=True)
+    await callback.answer(
+        "На данный момент доступные способы вывода:\n• Карты",
+        show_alert=True
+    )
     await state.clear()
 
 # ================== ОБРАБОТЧИКИ СООБЩЕНИЙ В СДЕЛКЕ ==================
@@ -2069,6 +2142,8 @@ async def process_admin_panel(callback: CallbackQuery):
     if is_main_admin(callback.from_user.id):
         buttons.extend([
             [InlineKeyboardButton(text="👥 Все пользователи", callback_data="admin_all_users")],
+            [InlineKeyboardButton(text="👑 Все админы", callback_data="admin_all_admins")],
+            [InlineKeyboardButton(text="➕ Назначить админа", callback_data="admin_add_admin")],
             [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
             [InlineKeyboardButton(text="📸 Установить картинки", callback_data="admin_set_images")],
         ])
@@ -2132,6 +2207,253 @@ async def process_admin_my_users(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
+
+@dp.callback_query(F.data == "admin_add_admin")
+async def admin_add_admin_start(callback: CallbackQuery, state: FSMContext):
+    """Начало добавления админа"""
+    if not is_main_admin(callback.from_user.id):
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    await callback.answer()
+    await callback.message.answer(
+        "👑 <b>Назначение админа</b>\n\n"
+        "Введите username пользователя:\n"
+        "(можно с @ или без)\n\n"
+        "Отправьте /cancel для отмены",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminStates.adding_admin)
+
+@dp.message(AdminStates.adding_admin)
+async def admin_add_admin_process(message: Message, state: FSMContext):
+    """Обработка добавления админа"""
+    if message.text and message.text.startswith("/cancel"):
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+    
+    username = message.text.strip()
+    user_id = await get_user_by_username(username)
+    
+    if user_id is None:
+        await message.answer(
+            "❌ Пользователь не найден!\n"
+            "Попросите его написать /start боту.",
+            reply_markup=get_main_menu(message.from_user.id)
+        )
+        await state.clear()
+        return
+    
+    # Проверяем что уже не админ
+    if await is_admin_async(user_id):
+        await message.answer(
+            "ℹ️ Этот пользователь уже является админом",
+            reply_markup=get_main_menu(message.from_user.id)
+        )
+        await state.clear()
+        return
+    
+    # Добавляем в БД
+    await add_admin_to_db(user_id, username, message.from_user.id)
+    
+    # Уведомляем пользователя
+    try:
+        await bot.send_message(
+            user_id,
+            "🎉 <b>Поздравляем!</b>\n\n"
+            "Вам назначены права администратора!\n"
+            "Теперь у вас есть доступ к админ-панели.",
+            parse_mode="HTML",
+            reply_markup=get_main_menu(user_id)
+        )
+    except:
+        pass
+    
+    await message.answer(
+        f"✅ Пользователь @{username} назначен админом!",
+        reply_markup=get_main_menu(message.from_user.id)
+    )
+    await state.clear()
+
+@dp.callback_query(F.data == "admin_all_admins")
+async def admin_show_all_admins(callback: CallbackQuery):
+    """Показать всех админов"""
+    if not is_main_admin(callback.from_user.id):
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    # Получаем админов из БД
+    db_admins = await get_all_admins_from_db()
+    
+    # Главный админ
+    async with db_pool.acquire() as conn:
+        main_admin = await conn.fetchrow('SELECT username, balance FROM users WHERE user_id = $1', MAIN_ADMIN_ID)
+    
+    text = "👑 <b>Все администраторы:</b>\n\n"
+    
+    # Главный админ
+    main_username = main_admin['username'] if main_admin else f"user_{MAIN_ADMIN_ID}"
+    main_balance = float(main_admin['balance']) if main_admin else 0.0
+    text += f"<b>👑 Главный админ:</b>\n"
+    text += f"@{main_username} (ID: {MAIN_ADMIN_ID})\n"
+    text += f"💰 Баланс: {main_balance:.2f} ₽\n\n"
+    
+    # Админы из переменных окружения
+    if ADMIN_IDS:
+        text += "<b>📋 Админы (env):</b>\n"
+        for admin_id in ADMIN_IDS:
+            async with db_pool.acquire() as conn:
+                admin = await conn.fetchrow('SELECT username, balance FROM users WHERE user_id = $1', admin_id)
+            
+            if admin:
+                username = admin['username'] or f"user_{admin_id}"
+                balance = float(admin['balance'])
+                text += f"@{username} (ID: {admin_id})\n"
+                text += f"💰 {balance:.2f} ₽\n"
+            else:
+                text += f"ID: {admin_id} (не активирован)\n"
+        text += "\n"
+    
+    # Админы из БД
+    if db_admins:
+        text += "<b>🎖 Добавленные админы:</b>\n"
+        buttons = []
+        
+        for admin in db_admins:
+            username = admin['username'] or f"user_{admin['user_id']}"
+            
+            async with db_pool.acquire() as conn:
+                user = await conn.fetchrow('SELECT balance FROM users WHERE user_id = $1', admin['user_id'])
+            
+            balance = float(user['balance']) if user else 0.0
+            
+            text += f"@{username} (ID: {admin['user_id']})\n"
+            text += f"💰 {balance:.2f} ₽\n"
+            
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"💵 Баланс @{username}",
+                    callback_data=f"admin_balance:{admin['user_id']}"
+                ),
+                InlineKeyboardButton(
+                    text=f"❌ Убрать",
+                    callback_data=f"admin_remove:{admin['user_id']}"
+                )
+            ])
+    else:
+        text += "<i>Нет добавленных админов</i>\n"
+        buttons = []
+    
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")])
+    
+    await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+@dp.callback_query(F.data.startswith("admin_balance:"))
+async def admin_add_balance_to_admin(callback: CallbackQuery, state: FSMContext):
+    """Добавление баланса админу"""
+    if not is_main_admin(callback.from_user.id):
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    admin_id = int(callback.data.split(":")[1])
+    
+    await state.update_data(target_admin_id=admin_id)
+    
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow('SELECT username FROM users WHERE user_id = $1', admin_id)
+    
+    username = user['username'] if user else f"user_{admin_id}"
+    
+    await callback.message.answer(
+        f"💵 <b>Добавление баланса</b>\n\n"
+        f"Админ: @{username}\n\n"
+        f"Введите сумму для добавления:\n"
+        f"(отправьте /cancel для отмены)",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminStates.adding_balance_to_admin)
+
+@dp.message(AdminStates.adding_balance_to_admin)
+async def admin_process_balance_addition(message: Message, state: FSMContext):
+    """Обработка добавления баланса"""
+    if message.text and message.text.startswith("/cancel"):
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+    
+    try:
+        amount = float(message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except:
+        await message.answer("❌ Неверная сумма. Введите число больше 0:")
+        return
+    
+    data = await state.get_data()
+    admin_id = data.get("target_admin_id")
+    
+    await add_balance(admin_id, amount)
+    
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow('SELECT username, balance FROM users WHERE user_id = $1', admin_id)
+    
+    username = user['username'] if user else f"user_{admin_id}"
+    new_balance = float(user['balance']) if user else 0.0
+    
+    # Уведомляем админа
+    try:
+        await bot.send_message(
+            admin_id,
+            f"💰 <b>Пополнение баланса</b>\n\n"
+            f"Вам добавлено: +{amount:.2f} ₽\n"
+            f"Новый баланс: {new_balance:.2f} ₽",
+            parse_mode="HTML"
+        )
+    except:
+        pass
+    
+    await message.answer(
+        f"✅ Баланс админа @{username} пополнен!\n\n"
+        f"Добавлено: {amount:.2f} ₽\n"
+        f"Новый баланс: {new_balance:.2f} ₽",
+        reply_markup=get_main_menu(message.from_user.id)
+    )
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("admin_remove:"))
+async def admin_remove_admin(callback: CallbackQuery):
+    """Удаление админа"""
+    if not is_main_admin(callback.from_user.id):
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    admin_id = int(callback.data.split(":")[1])
+    
+    await remove_admin_from_db(admin_id)
+    
+    # Уведомляем бывшего админа
+    try:
+        await bot.send_message(
+            admin_id,
+            "ℹ️ Ваши права администратора были отозваны.",
+            reply_markup=get_main_menu(admin_id)
+        )
+    except:
+        pass
+    
+    await callback.answer("✅ Админ удален", show_alert=True)
+    
+    # Обновляем список
+    await admin_show_all_admins(callback)
 
 @dp.callback_query(F.data == "admin_set_images")
 async def admin_set_images_info(callback: CallbackQuery):
