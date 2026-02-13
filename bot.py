@@ -2364,8 +2364,9 @@ async def admin_add_admin_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await callback.message.answer(
         "👑 <b>Назначение админа</b>\n\n"
-        "Введите username пользователя:\n"
-        "(можно с @ или без)\n\n"
+        "Введите ID пользователя:\n"
+        "(число, например: 123456789)\n\n"
+        "💡 ID можно узнать через @userinfobot\n\n"
         "Отправьте /cancel для отмены",
         parse_mode="HTML"
     )
@@ -2379,16 +2380,13 @@ async def admin_add_admin_process(message: Message, state: FSMContext):
         await message.answer("❌ Отменено")
         return
     
-    username = message.text.strip().lstrip('@')
-    user_id = await get_user_by_username(username)
-    
-    if user_id is None:
+    try:
+        user_id = int(message.text.strip())
+    except:
         await message.answer(
-            "❌ Пользователь не найден!\n"
-            "Попросите его написать /start боту.",
-            reply_markup=get_main_menu(message.from_user.id)
+            "❌ Неверный формат!\n"
+            "Введите ID числом (например: 123456789)"
         )
-        await state.clear()
         return
     
     # Проверяем что уже не админ
@@ -2400,8 +2398,22 @@ async def admin_add_admin_process(message: Message, state: FSMContext):
         await state.clear()
         return
     
-    # Убедимся что пользователь существует в БД
-    await ensure_user_exists(user_id, username)
+    # Проверяем что пользователь существует в БД
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow('SELECT username FROM users WHERE user_id = $1', user_id)
+    
+    if not user:
+        await message.answer(
+            "❌ Пользователь не найден в базе данных!\n\n"
+            "Попросите его:\n"
+            "1. Написать /start боту\n"
+            "2. Затем попробуйте снова",
+            reply_markup=get_main_menu(message.from_user.id)
+        )
+        await state.clear()
+        return
+    
+    username = user['username'] or f"user_{user_id}"
     
     # Добавляем в БД
     await add_admin_to_db(user_id, username, message.from_user.id)
