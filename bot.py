@@ -2286,6 +2286,7 @@ async def process_admin_panel(callback: CallbackQuery):
     buttons = []
     
     if is_main_admin(callback.from_user.id):
+        # ТОЛЬКО для главного админа
         buttons.extend([
             [InlineKeyboardButton(text="👥 Все пользователи", callback_data="admin_all_users")],
             [InlineKeyboardButton(text="👑 Все админы", callback_data="admin_all_admins")],
@@ -2294,7 +2295,7 @@ async def process_admin_panel(callback: CallbackQuery):
             [InlineKeyboardButton(text="📸 Установить картинки", callback_data="admin_set_images")],
         ])
     else:
-        # Для доп админов показываем пользователей с кем были сделки
+        # Для доп админов ТОЛЬКО свои пользователи
         buttons.append([InlineKeyboardButton(text="👥 Мои пользователи", callback_data="admin_my_users")])
     
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
@@ -2375,25 +2376,44 @@ async def admin_add_admin_start(callback: CallbackQuery, state: FSMContext):
 @dp.message(AdminStates.adding_admin)
 async def admin_add_admin_process(message: Message, state: FSMContext):
     """Обработка добавления админа"""
+    logger.info(f"Получен запрос на добавление админа от {message.from_user.id}: {message.text}")
+    
     if message.text and message.text.startswith("/cancel"):
         await state.clear()
         await message.answer("❌ Отменено")
         return
     
+    # Отправляем статус главному админу
+    status_msg = await message.answer("⏳ Обработка запроса...")
+    
     try:
         user_id = int(message.text.strip())
-    except:
-        await message.answer(
-            "❌ Неверный формат!\n"
-            "Введите ID числом (например: 123456789)"
+        logger.info(f"Парсинг ID успешен: {user_id}")
+        await status_msg.edit_text(
+            f"⏳ Обработка запроса...\n"
+            f"✅ Парсинг ID успешен: {user_id}"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка парсинга ID: {e}")
+        await status_msg.edit_text(
+            f"❌ Неверный формат!\n"
+            f"Введите ID числом (например: 123456789)"
         )
         return
     
     # Проверяем что уже не админ
-    if await is_admin_async(user_id):
-        await message.answer(
-            "ℹ️ Этот пользователь уже является админом",
-            reply_markup=get_main_menu(message.from_user.id)
+    is_already_admin = await is_admin_async(user_id)
+    logger.info(f"Проверка is_admin для {user_id}: {is_already_admin}")
+    
+    await status_msg.edit_text(
+        f"⏳ Обработка запроса...\n"
+        f"✅ Парсинг ID успешен: {user_id}\n"
+        f"✅ Проверка is_admin: {is_already_admin}"
+    )
+    
+    if is_already_admin:
+        await status_msg.edit_text(
+            "ℹ️ Этот пользователь уже является админом"
         )
         await state.clear()
         return
@@ -2402,25 +2422,51 @@ async def admin_add_admin_process(message: Message, state: FSMContext):
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow('SELECT username FROM users WHERE user_id = $1', user_id)
     
+    logger.info(f"Пользователь в БД: {user}")
+    
     if not user:
-        await message.answer(
-            "❌ Пользователь не найден в базе данных!\n\n"
-            "Попросите его:\n"
-            "1. Написать /start боту\n"
-            "2. Затем попробуйте снова",
-            reply_markup=get_main_menu(message.from_user.id)
+        await status_msg.edit_text(
+            f"❌ Пользователь не найден в базе данных!\n\n"
+            f"ID: {user_id}\n\n"
+            f"Попросите его:\n"
+            f"1. Написать /start боту\n"
+            f"2. Затем попробуйте снова"
         )
         await state.clear()
         return
     
     username = user['username'] or f"user_{user_id}"
+    logger.info(f"Username: {username}")
+    
+    await status_msg.edit_text(
+        f"⏳ Обработка запроса...\n"
+        f"✅ Парсинг ID успешен: {user_id}\n"
+        f"✅ Проверка is_admin: False\n"
+        f"✅ Пользователь в БД: @{username}"
+    )
     
     # Добавляем в БД
-    await add_admin_to_db(user_id, username, message.from_user.id)
-    
-    logger.info(f"Админ добавлен: {user_id} (@{username}) главным админом {message.from_user.id}")
+    try:
+        await add_admin_to_db(user_id, username, message.from_user.id)
+        logger.info(f"✅ Админ добавлен в БД: {user_id} (@{username})")
+        
+        await status_msg.edit_text(
+            f"⏳ Обработка запроса...\n"
+            f"✅ Парсинг ID успешен: {user_id}\n"
+            f"✅ Проверка is_admin: False\n"
+            f"✅ Пользователь в БД: @{username}\n"
+            f"✅ Админ добавлен в БД"
+        )
+    except Exception as e:
+        logger.error(f"❌ Ошибка добавления в БД: {e}")
+        await status_msg.edit_text(
+            f"❌ Ошибка при добавлении админа:\n{str(e)}"
+        )
+        await state.clear()
+        return
     
     # Уведомляем пользователя
+    notification_sent = False
     try:
         await bot.send_message(
             user_id,
@@ -2430,17 +2476,29 @@ async def admin_add_admin_process(message: Message, state: FSMContext):
             "Нажмите /start чтобы увидеть кнопку 'Админ панель'",
             parse_mode="HTML"
         )
+        logger.info(f"✅ Уведомление отправлено пользователю {user_id}")
+        notification_sent = True
     except Exception as e:
-        logger.error(f"Ошибка уведомления нового админа: {e}")
+        logger.error(f"❌ Ошибка уведомления нового админа: {e}")
     
-    await message.answer(
-        f"✅ <b>Админ успешно назначен!</b>\n\n"
-        f"👤 Пользователь: @{username}\n"
-        f"🆔 ID: {user_id}\n\n"
-        f"Пользователь получил права администратора!",
-        parse_mode="HTML",
-        reply_markup=get_main_menu(message.from_user.id)
+    # Финальное сообщение с полным отчётом
+    final_report = (
+        f"✅ <b>АДМИН УСПЕШНО НАЗНАЧЕН!</b>\n\n"
+        f"<b>Отчёт:</b>\n"
+        f"✅ Парсинг ID: {user_id}\n"
+        f"✅ Проверка is_admin: False\n"
+        f"✅ Пользователь в БД: @{username}\n"
+        f"✅ Админ добавлен в БД\n"
+        f"{'✅' if notification_sent else '⚠️'} Уведомление пользователю: {'отправлено' if notification_sent else 'не доставлено'}\n\n"
+        f"👤 <b>Данные админа:</b>\n"
+        f"• Username: @{username}\n"
+        f"• ID: <code>{user_id}</code>\n\n"
+        f"Пользователь получил права администратора!"
     )
+    
+    await status_msg.edit_text(final_report, parse_mode="HTML")
+    
+    logger.info(f"✅ Процесс добавления админа завершен успешно")
     await state.clear()
 
 @dp.callback_query(F.data == "admin_all_admins")
