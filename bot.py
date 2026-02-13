@@ -2277,7 +2277,7 @@ async def process_deal_message(message: Message):
 @dp.callback_query(F.data == "admin_panel")
 async def process_admin_panel(callback: CallbackQuery):
     """Админ-панель"""
-    if not is_admin(callback.from_user.id):
+    if not await is_admin_async(callback.from_user.id):
         await callback.answer("❌ У вас нет доступа", show_alert=True)
         return
     
@@ -2309,7 +2309,7 @@ async def process_admin_panel(callback: CallbackQuery):
 @dp.callback_query(F.data == "admin_my_users")
 async def process_admin_my_users(callback: CallbackQuery):
     """Пользователи с кем были сделки (для доп админов)"""
-    if not is_admin(callback.from_user.id):
+    if not await is_admin_async(callback.from_user.id):
         await callback.answer("❌ У вас нет доступа", show_alert=True)
         return
     
@@ -2761,7 +2761,7 @@ async def process_admin_all_users(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("admin_user:"))
 async def process_admin_user_details(callback: CallbackQuery, state: FSMContext):
     """Детали пользователя"""
-    if not is_admin(callback.from_user.id):
+    if not await is_admin_async(callback.from_user.id):
         await callback.answer("❌ У вас нет доступа", show_alert=True)
         return
     
@@ -2822,7 +2822,7 @@ async def process_admin_user_details(callback: CallbackQuery, state: FSMContext)
 @dp.callback_query(F.data.startswith("admin_reply:"))
 async def process_admin_reply_start(callback: CallbackQuery, state: FSMContext):
     """Начало ответа"""
-    if not is_admin(callback.from_user.id):
+    if not await is_admin_async(callback.from_user.id):
         await callback.answer("❌ У вас нет доступа", show_alert=True)
         return
     
