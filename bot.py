@@ -150,9 +150,16 @@ async def init_db():
                     user_id BIGINT PRIMARY KEY,
                     username TEXT,
                     added_by BIGINT,
+                    is_super BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            # Добавляем колонку is_super если её нет
+            try:
+                await conn.execute('ALTER TABLE admins ADD COLUMN IF NOT EXISTS is_super BOOLEAN DEFAULT FALSE')
+            except:
+                pass
             
             # Индексы для оптимизации
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id)')
@@ -405,42 +412,39 @@ async def get_user_payment_requests(user_id: int) -> List[dict]:
 async def get_users_with_deals(admin_id: int) -> List[int]:
     """Получает пользователей, с которыми админ имел сделки"""
     async with db_pool.acquire() as conn:
-        # Находим всех пользователей из сообщений где админ был партнером
+        # Находим всех уникальных партнеров из сообщений
         users = await conn.fetch(
-            '''SELECT DISTINCT user_id FROM messages 
-               WHERE partner_id = $1 OR sender_id = $1''',
+            '''SELECT DISTINCT 
+                   CASE 
+                       WHEN sender_id = $1 THEN partner_id
+                       WHEN partner_id = $1 THEN sender_id
+                       ELSE user_id
+                   END as partner_user_id
+               FROM messages 
+               WHERE sender_id = $1 OR partner_id = $1''',
             admin_id
         )
-        return [u['user_id'] for u in users if u['user_id'] != admin_id]
+        return [u['partner_user_id'] for u in users if u['partner_user_id'] and u['partner_user_id'] != admin_id]
 
-async def add_admin_to_db(user_id: int, username: str, added_by: int):
+async def add_admin_to_db(user_id: int, username: str, added_by: int, is_super: bool = False):
     """Добавляет админа в базу данных"""
     async with db_pool.acquire() as conn:
         await conn.execute(
-            '''INSERT INTO admins (user_id, username, added_by) 
-               VALUES ($1, $2, $3)
-               ON CONFLICT (user_id) DO NOTHING''',
-            user_id, username, added_by
+            '''INSERT INTO admins (user_id, username, added_by, is_super) 
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (user_id) DO UPDATE SET is_super = $4''',
+            user_id, username, added_by, is_super
         )
-        logger.info(f"Админ добавлен: {user_id} (@{username}) добавил {added_by}")
+        logger.info(f"Админ добавлен: {user_id} (@{username}), главный={is_super}")
 
-async def remove_admin_from_db(user_id: int):
-    """Удаляет админа из базы данных"""
+async def is_super_admin_in_db(user_id: int) -> bool:
+    """Проверяет является ли пользователь главным админом в БД"""
     async with db_pool.acquire() as conn:
-        await conn.execute('DELETE FROM admins WHERE user_id = $1', user_id)
-        logger.info(f"Админ удален: {user_id}")
-
-async def get_all_admins_from_db() -> List[dict]:
-    """Получает всех админов из базы данных"""
-    async with db_pool.acquire() as conn:
-        admins = await conn.fetch('SELECT * FROM admins ORDER BY created_at DESC')
-        return [dict(a) for a in admins]
-
-async def is_admin_in_db(user_id: int) -> bool:
-    """Проверяет является ли пользователь админом в БД"""
-    async with db_pool.acquire() as conn:
-        result = await conn.fetchval('SELECT user_id FROM admins WHERE user_id = $1', user_id)
-        return result is not None
+        result = await conn.fetchval(
+            'SELECT is_super FROM admins WHERE user_id = $1', 
+            user_id
+        )
+        return result is True
 
 def is_admin(user_id: int) -> bool:
     """Проверяет является ли пользователь админом (включая главного)"""
@@ -451,6 +455,30 @@ async def is_admin_async(user_id: int) -> bool:
     if user_id == MAIN_ADMIN_ID or user_id in ADMIN_IDS:
         return True
     return await is_admin_in_db(user_id)
+
+async def is_super_admin_async(user_id: int) -> bool:
+    """Проверяет является ли главным админом (env или БД)"""
+    if user_id == MAIN_ADMIN_ID:
+        return True
+    return await is_super_admin_in_db(user_id)
+
+async def remove_admin_from_db(user_id: int):
+    """Удаляет админа из базы данных"""
+    async with db_pool.acquire() as conn:
+        await conn.execute('DELETE FROM admins WHERE user_id = $1', user_id)
+        logger.info(f"Админ удален: {user_id}")
+
+async def get_all_admins_from_db() -> List[dict]:
+    """Получает всех админов из базы данных"""
+    async with db_pool.acquire() as conn:
+        admins = await conn.fetch('SELECT * FROM admins ORDER BY is_super DESC, created_at DESC')
+        return [dict(a) for a in admins]
+
+async def is_admin_in_db(user_id: int) -> bool:
+    """Проверяет является ли пользователь админом в БД"""
+    async with db_pool.acquire() as conn:
+        result = await conn.fetchval('SELECT user_id FROM admins WHERE user_id = $1', user_id)
+        return result is not None
 
 # ================== IMGBB ФУНКЦИИ ==================
 
@@ -548,7 +576,14 @@ def is_admin(user_id: int) -> bool:
     return user_id in ALL_ADMINS
 
 def is_main_admin(user_id: int) -> bool:
-    return user_id == MAIN_ADMIN_ID
+    """Проверяет является ли пользователь главным админом"""
+    # Главный админ из MAIN_ADMIN_ID
+    if user_id == MAIN_ADMIN_ID:
+        return True
+    # Также главными админами считаются все из ADMIN_IDS (переменная окружения)
+    if user_id in ADMIN_IDS:
+        return True
+    return False
 
 def parse_price(price_str: str) -> float:
     try:
@@ -2285,17 +2320,21 @@ async def process_admin_panel(callback: CallbackQuery):
     
     buttons = []
     
-    if is_main_admin(callback.from_user.id):
-        # ТОЛЬКО для главного админа
+    # Проверяем является ли главным админом (env или БД)
+    is_super = await is_super_admin_async(callback.from_user.id)
+    
+    if is_super:
+        # Для главных админов - полный доступ
         buttons.extend([
             [InlineKeyboardButton(text="👥 Все пользователи", callback_data="admin_all_users")],
             [InlineKeyboardButton(text="👑 Все админы", callback_data="admin_all_admins")],
             [InlineKeyboardButton(text="➕ Назначить админа", callback_data="admin_add_admin")],
+            [InlineKeyboardButton(text="⭐ Назначить главного админа", callback_data="admin_add_super")],
             [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
             [InlineKeyboardButton(text="📸 Установить картинки", callback_data="admin_set_images")],
         ])
     else:
-        # Для доп админов ТОЛЬКО свои пользователи
+        # Для обычных админов - только свои пользователи
         buttons.append([InlineKeyboardButton(text="👥 Мои пользователи", callback_data="admin_my_users")])
     
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
@@ -2308,7 +2347,7 @@ async def process_admin_panel(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_my_users")
 async def process_admin_my_users(callback: CallbackQuery):
-    """Пользователи с кем были сделки (для доп админов)"""
+    """Пользователи с кем доп админ проводил сделки"""
     if not await is_admin_async(callback.from_user.id):
         await callback.answer("❌ У вас нет доступа", show_alert=True)
         return
@@ -2330,12 +2369,33 @@ async def process_admin_my_users(callback: CallbackQuery):
     
     async with db_pool.acquire() as conn:
         users = await conn.fetch(
-            'SELECT * FROM users WHERE user_id = ANY($1)',
+            'SELECT * FROM users WHERE user_id = ANY($1) ORDER BY created_at DESC',
             user_ids
         )
     
     buttons = []
-    for user in users:
+    for user in users[:50]:
+        username = user['username'] or f"user_{user['user_id']}"
+        balance = float(user['balance'])
+        
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"@{username} | 💰{balance:.2f}₽ | ✅{user['deals_completed']}",
+                callback_data=f"admin_user:{user['user_id']}"
+            )
+        ])
+    
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")])
+    
+    await callback.message.answer(
+        f"👥 <b>Ваши пользователи: {len(users)}</b>\n"
+        f"(с кем вы проводили сделки)",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    
+    buttons = []
+    for user in users[:50]:  # Первые 50
         username = user['username'] or f"user_{user['user_id']}"
         balance = float(user['balance'])
         
@@ -2349,8 +2409,8 @@ async def process_admin_my_users(callback: CallbackQuery):
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")])
     
     await callback.message.answer(
-        f"👥 <b>Ваши пользователи: {len(users)}</b>\n"
-        f"(только те, с кем были сделки)",
+        f"👥 <b>Мои пользователи: {len(users)}</b>\n"
+        f"(с кем были сделки)",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
@@ -2718,42 +2778,257 @@ async def admin_broadcast_button(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.broadcast_message)
 
 @dp.callback_query(F.data == "admin_all_users")
+@dp.callback_query(F.data == "admin_all_users")
 async def process_admin_all_users(callback: CallbackQuery):
-    """Все пользователи"""
+    """Все пользователи - выбор периода"""
     if not is_main_admin(callback.from_user.id):
         await callback.answer("❌ У вас нет доступа", show_alert=True)
         return
     
     await callback.answer()
     
-    users = await get_all_users()
+    # Показываем фильтры по датам
+    buttons = [
+        [InlineKeyboardButton(text="📅 Сегодня", callback_data="users_today")],
+        [InlineKeyboardButton(text="📆 За 7 дней", callback_data="users_week")],
+        [InlineKeyboardButton(text="📊 За месяц", callback_data="users_month")],
+        [InlineKeyboardButton(text="🗓 По месяцам", callback_data="users_by_months")],
+        [InlineKeyboardButton(text="📋 Все время", callback_data="users_all")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")]
+    ]
     
-    if not users:
+    await callback.message.answer(
+        "📊 <b>Все пользователи</b>\n\n"
+        "Выберите период:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+@dp.callback_query(F.data == "users_today")
+async def show_users_today(callback: CallbackQuery):
+    """Пользователи за сегодня"""
+    await callback.answer()
+    
+    from datetime import datetime, timedelta
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch(
+            'SELECT * FROM users WHERE deals_completed > 0 AND created_at >= $1 ORDER BY created_at DESC',
+            today
+        )
+    
+    await show_users_list(callback, users, "📅 Пользователи за сегодня")
+
+@dp.callback_query(F.data == "users_week")
+async def show_users_week(callback: CallbackQuery):
+    """Пользователи за 7 дней"""
+    await callback.answer()
+    
+    from datetime import datetime, timedelta
+    week_ago = datetime.now() - timedelta(days=7)
+    
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch(
+            'SELECT * FROM users WHERE deals_completed > 0 AND created_at >= $1 ORDER BY created_at DESC',
+            week_ago
+        )
+    
+    await show_users_list(callback, users, "📆 Пользователи за 7 дней")
+
+@dp.callback_query(F.data == "users_month")
+async def show_users_month(callback: CallbackQuery):
+    """Пользователи за месяц"""
+    await callback.answer()
+    
+    from datetime import datetime, timedelta
+    month_ago = datetime.now() - timedelta(days=30)
+    
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch(
+            'SELECT * FROM users WHERE deals_completed > 0 AND created_at >= $1 ORDER BY created_at DESC',
+            month_ago
+        )
+    
+    await show_users_list(callback, users, "📊 Пользователи за месяц")
+
+@dp.callback_query(F.data == "users_all")
+async def show_users_all(callback: CallbackQuery):
+    """Все пользователи с сделками"""
+    await callback.answer()
+    
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch(
+            'SELECT * FROM users WHERE deals_completed > 0 ORDER BY deals_completed DESC, created_at DESC'
+        )
+    
+    await show_users_list(callback, users, "📋 Все пользователи")
+
+@dp.callback_query(F.data == "users_by_months")
+async def show_months_selection(callback: CallbackQuery):
+    """Выбор месяца"""
+    await callback.answer()
+    
+    from datetime import datetime
+    
+    # Получаем список месяцев с пользователями
+    async with db_pool.acquire() as conn:
+        months_data = await conn.fetch(
+            '''SELECT DISTINCT 
+                   DATE_TRUNC('month', created_at) as month,
+                   COUNT(*) as count
+               FROM users 
+               WHERE deals_completed > 0
+               GROUP BY DATE_TRUNC('month', created_at)
+               ORDER BY month DESC
+               LIMIT 12'''
+        )
+    
+    if not months_data:
         await callback.message.answer(
             "📊 Нет пользователей",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")]
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_all_users")]
             ])
         )
         return
     
     buttons = []
-    for user in users[:50]:
-        username = user['username'] or f"user_{user['user_id']}"
-        balance = float(user['balance'])
+    month_names = {
+        1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+        5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+        9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
+    }
+    
+    for row in months_data:
+        month_date = row['month']
+        count = row['count']
+        month_name = month_names[month_date.month]
+        year = month_date.year
+        
+        # Формат callback: users_month_YYYY_MM
+        callback_data = f"users_month_{year}_{month_date.month:02d}"
         
         buttons.append([
             InlineKeyboardButton(
-                text=f"@{username} | 💰{balance:.2f}₽ | ✅{user['deals_completed']}",
-                callback_data=f"admin_user:{user['user_id']}"
+                text=f"{month_name} {year} ({count} чел.)",
+                callback_data=callback_data
             )
         ])
     
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_all_users")])
     
     await callback.message.answer(
-        f"👥 <b>Всего пользователей: {len(users)}</b>\n"
-        f"(показано первых 50)",
+        "🗓 <b>Выберите месяц:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+@dp.callback_query(F.data.startswith("users_month_"))
+async def show_users_by_month(callback: CallbackQuery):
+    """Пользователи конкретного месяца"""
+    await callback.answer()
+    
+    from datetime import datetime, timedelta
+    from calendar import monthrange
+    
+    # Парсим callback_data: users_month_2026_02
+    parts = callback.data.split("_")
+    year = int(parts[2])
+    month = int(parts[3])
+    
+    month_names = {
+        1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+        5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+        9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
+    }
+    
+    month_start = datetime(year, month, 1)
+    # Последний день месяца
+    last_day = monthrange(year, month)[1]
+    month_end = datetime(year, month, last_day, 23, 59, 59)
+    
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch(
+            '''SELECT * FROM users 
+               WHERE deals_completed > 0 
+               AND created_at >= $1 
+               AND created_at <= $2 
+               ORDER BY created_at DESC''',
+            month_start, month_end
+        )
+    
+    await show_users_list(
+        callback, 
+        users, 
+        f"🗓 {month_names[month]} {year}",
+        back_callback="users_by_months"
+    )
+
+async def show_users_list(callback, users, title, back_callback="admin_all_users"):
+    """Показать список пользователей"""
+    if not users:
+        await callback.message.answer(
+            f"{title}\n\n📊 Пока нет пользователей",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data=back_callback)]
+            ])
+        )
+        return
+    
+    # Группируем по датам (каждые 5 дней)
+    from datetime import datetime, timedelta
+    from collections import defaultdict
+    
+    grouped = defaultdict(list)
+    for user in users:
+        # Округляем до 5 дней
+        date = user['created_at'].date()
+        # Находим начало 5-дневного периода
+        days_since_epoch = (date - datetime(2020, 1, 1).date()).days
+        period_start_days = (days_since_epoch // 5) * 5
+        period_start = datetime(2020, 1, 1).date() + timedelta(days=period_start_days)
+        
+        grouped[period_start].append(user)
+    
+    # Сортируем периоды по убыванию
+    sorted_periods = sorted(grouped.keys(), reverse=True)
+    
+    text = f"<b>{title}</b>\n\n"
+    text += f"👥 Всего: {len(users)}\n\n"
+    
+    buttons = []
+    
+    for period_start in sorted_periods[:20]:  # Первые 20 периодов
+        period_end = period_start + timedelta(days=4)
+        period_users = grouped[period_start]
+        
+        text += f"📅 <b>{period_start.strftime('%d.%m')} - {period_end.strftime('%d.%m.%Y')}</b> ({len(period_users)} чел.)\n"
+        
+        for user in period_users[:10]:  # Первые 10 из периода
+            username = user['username'] or f"user_{user['user_id']}"
+            balance = float(user['balance'])
+            deals = user['deals_completed']
+            
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"  @{username} | 💰{balance:.0f}₽ | ✅{deals}",
+                    callback_data=f"admin_user:{user['user_id']}"
+                )
+            ])
+        
+        if len(period_users) > 10:
+            text += f"  ... и ещё {len(period_users) - 10}\n"
+        
+        text += "\n"
+    
+    if len(sorted_periods) > 20:
+        text += f"... и ещё {len(sorted_periods) - 20} периодов\n"
+    
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=back_callback)])
+    
+    await callback.message.answer(
+        text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
