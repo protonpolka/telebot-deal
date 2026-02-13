@@ -485,8 +485,11 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 # Хранилище активных сделок (в памяти)
-active_deals: Dict[int, dict] = {}
+# Формат: {user_id: [deal1, deal2, ...]}
+active_deals: Dict[int, List[dict]] = {}
 pending_deals: Dict[int, dict] = {}
+# Хранилище текущей активной сделки для общения
+current_chat_deal: Dict[int, int] = {}  # {user_id: deal_index}
 
 # ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
 
@@ -507,6 +510,7 @@ def get_main_menu(user_id: int = None):
     """Главное меню"""
     buttons = [
         [InlineKeyboardButton(text="🧾 Сделка", callback_data="deal")],
+        [InlineKeyboardButton(text="📋 Активные сделки", callback_data="active_deals")],
         [InlineKeyboardButton(text="💳 Пополнить", callback_data="deposit")],
         [InlineKeyboardButton(text="💸 Вывод", callback_data="withdrawal")],
         [InlineKeyboardButton(text="➕ Добавить товар", callback_data="add_product")],
@@ -521,10 +525,12 @@ def get_main_menu(user_id: int = None):
 
 def get_chat_keyboard(is_buyer: bool = False):
     """Клавиатура чата"""
-    buttons = []
+    buttons = [
+        [InlineKeyboardButton(text="📋 Активные сделки", callback_data="active_deals")]
+    ]
     if is_buyer:
-        buttons.append([InlineKeyboardButton(text="✅ Подтвердить получение", callback_data="confirm_receipt")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+        buttons.insert(0, [InlineKeyboardButton(text="✅ Подтвердить получение", callback_data="confirm_receipt")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_accept_deal_keyboard(initiator_id: int, product_id: int):
     """Клавиатура принятия сделки"""
@@ -782,10 +788,6 @@ async def process_deal_button(callback: CallbackQuery, state: FSMContext):
     
     user_id = callback.from_user.id
     
-    if user_id in active_deals:
-        await callback.message.answer("⚠️ Вы уже находитесь в активной сделке!")
-        return
-    
     await ensure_user_exists(user_id, callback.from_user.username)
     products = await get_user_products_for_sale(user_id)  # Только не проданные
     
@@ -802,6 +804,94 @@ async def process_deal_button(callback: CallbackQuery, state: FSMContext):
         "(можно с @ или без)"
     )
     await state.set_state(DealStates.waiting_for_username)
+
+@dp.callback_query(F.data == "active_deals")
+async def show_active_deals(callback: CallbackQuery):
+    """Показать активные сделки"""
+    await callback.answer()
+    
+    user_id = callback.from_user.id
+    user_deals = active_deals.get(user_id, [])
+    
+    if not user_deals:
+        await callback.message.answer(
+            "📋 У вас нет активных сделок",
+            reply_markup=get_main_menu(user_id)
+        )
+        return
+    
+    text = "📋 <b>Ваши активные сделки:</b>\n\n"
+    buttons = []
+    
+    for idx, deal in enumerate(user_deals):
+        partner_id = deal["partner_id"]
+        product = deal["product"]
+        role = "Продавец" if user_id == deal["seller_id"] else "Покупатель"
+        
+        # Получаем username партнера
+        async with db_pool.acquire() as conn:
+            partner = await conn.fetchrow('SELECT username FROM users WHERE user_id = $1', partner_id)
+        
+        partner_username = partner['username'] if partner else f"user_{partner_id}"
+        
+        deal_info = f"{idx + 1}. С @{partner_username} ({role})"
+        
+        buttons.append([
+            InlineKeyboardButton(
+                text=deal_info,
+                callback_data=f"select_deal:{idx}"
+            )
+        ])
+        
+        text += f"{idx + 1}. <b>{'Вы продаёте' if role == 'Продавец' else 'Вы покупаете'}</b>\n"
+        text += f"   👤 Партнёр: @{partner_username}\n"
+        text += f"   📦 Товар: {product['name']}\n"
+        text += f"   💰 Цена: {product['price']}\n\n"
+    
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
+    
+    await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+@dp.callback_query(F.data.startswith("select_deal:"))
+async def select_active_deal(callback: CallbackQuery):
+    """Выбор активной сделки для общения"""
+    await callback.answer()
+    
+    user_id = callback.from_user.id
+    deal_index = int(callback.data.split(":")[1])
+    
+    user_deals = active_deals.get(user_id, [])
+    
+    if deal_index >= len(user_deals):
+        await callback.answer("❌ Сделка не найдена", show_alert=True)
+        return
+    
+    # Устанавливаем текущую активную сделку
+    current_chat_deal[user_id] = deal_index
+    
+    deal = user_deals[deal_index]
+    partner_id = deal["partner_id"]
+    product = deal["product"]
+    is_buyer = user_id == deal["buyer_id"]
+    
+    async with db_pool.acquire() as conn:
+        partner = await conn.fetchrow('SELECT username FROM users WHERE user_id = $1', partner_id)
+    
+    partner_username = partner['username'] if partner else f"user_{partner_id}"
+    
+    await callback.message.answer(
+        f"💬 <b>Сделка активна</b>\n\n"
+        f"👤 Партнёр: @{partner_username}\n"
+        f"📦 Товар: {product['name']}\n"
+        f"💰 Цена: {product['price']}\n\n"
+        f"Пишите сообщения - они будут переданы партнёру",
+        parse_mode="HTML",
+        reply_markup=get_chat_keyboard(is_buyer=is_buyer)
+    )
 
 @dp.message(DealStates.waiting_for_username)
 async def process_partner_username(message: Message, state: FSMContext):
@@ -828,9 +918,11 @@ async def process_partner_username(message: Message, state: FSMContext):
         await state.clear()
         return
     
-    if partner_id in active_deals:
+    # Проверка: если пользователь НЕ админ, то партнер ДОЛЖЕН быть админом
+    if not is_admin(user_id) and not is_admin(partner_id):
         await message.answer(
-            "❌ Этот пользователь уже находится в активной сделке!",
+            "❌ Вы можете создавать сделки только с администраторами!\n"
+            f"Пользователь @{partner_username} не является администратором.",
             reply_markup=get_main_menu(user_id)
         )
         await state.clear()
@@ -960,11 +1052,6 @@ async def process_accept_deal(callback: CallbackQuery):
         await callback.message.answer("❌ Эта сделка уже неактуальна")
         return
     
-    if initiator_id in active_deals or partner_id in active_deals:
-        await callback.message.answer("❌ Один из участников уже в другой сделке")
-        del pending_deals[initiator_id]
-        return
-    
     product = pending_deals[initiator_id]["product"]
     price = parse_price(product["price"])
     
@@ -985,23 +1072,34 @@ async def process_accept_deal(callback: CallbackQuery):
     # Списываем средства
     await update_balance(partner_id, balance - price)
     
-    # Создаем активную сделку
-    active_deals[initiator_id] = {
+    # Создаем сделку
+    deal_data = {
         "partner_id": partner_id,
         "product": product,
         "product_id": product_id,
-        "confirmed": [],
         "seller_id": initiator_id,
         "buyer_id": partner_id
     }
-    active_deals[partner_id] = {
-        "partner_id": initiator_id,
-        "product": product,
-        "product_id": product_id,
-        "confirmed": [],
-        "seller_id": initiator_id,
-        "buyer_id": partner_id
-    }
+    
+    # Добавляем сделку в список активных для обоих
+    if initiator_id not in active_deals:
+        active_deals[initiator_id] = []
+    if partner_id not in active_deals:
+        active_deals[partner_id] = []
+    
+    # Для продавца
+    seller_deal = deal_data.copy()
+    seller_deal["partner_id"] = partner_id
+    active_deals[initiator_id].append(seller_deal)
+    
+    # Для покупателя
+    buyer_deal = deal_data.copy()
+    buyer_deal["partner_id"] = initiator_id
+    active_deals[partner_id].append(buyer_deal)
+    
+    # Устанавливаем текущую активную сделку
+    current_chat_deal[initiator_id] = len(active_deals[initiator_id]) - 1
+    current_chat_deal[partner_id] = len(active_deals[partner_id]) - 1
     
     del pending_deals[initiator_id]
     
@@ -1057,15 +1155,21 @@ async def process_confirm_receipt(callback: CallbackQuery):
     await callback.answer()
     
     user_id = callback.from_user.id
+    user_deals = active_deals.get(user_id, [])
     
-    if user_id not in active_deals:
+    if not user_deals:
         await callback.message.answer(
             "❌ У вас нет активной сделки",
             reply_markup=get_main_menu(user_id)
         )
         return
     
-    deal = active_deals[user_id]
+    # Получаем текущую сделку
+    deal_index = current_chat_deal.get(user_id, 0)
+    if deal_index >= len(user_deals):
+        deal_index = 0
+    
+    deal = user_deals[deal_index]
     
     if user_id != deal["buyer_id"]:
         await callback.answer("❌ Только покупатель может подтвердить получение", show_alert=True)
@@ -1107,15 +1211,21 @@ async def final_confirm_receipt(callback: CallbackQuery):
     await callback.answer()
     
     user_id = callback.from_user.id
+    user_deals = active_deals.get(user_id, [])
     
-    if user_id not in active_deals:
+    if not user_deals:
         await callback.message.answer(
             "❌ У вас нет активной сделки",
             reply_markup=get_main_menu(user_id)
         )
         return
     
-    deal = active_deals[user_id]
+    # Получаем текущую сделку
+    deal_index = current_chat_deal.get(user_id, 0)
+    if deal_index >= len(user_deals):
+        deal_index = 0
+    
+    deal = user_deals[deal_index]
     
     seller_id = deal["seller_id"]
     buyer_id = deal["buyer_id"]
@@ -1137,9 +1247,37 @@ async def final_confirm_receipt(callback: CallbackQuery):
     await increment_deals(seller_id)
     await increment_deals(buyer_id)
     
-    # Удаляем сделку
-    del active_deals[seller_id]
-    del active_deals[buyer_id]
+    # Удаляем эту сделку из списков обоих участников
+    seller_deals = active_deals.get(seller_id, [])
+    buyer_deals = active_deals.get(buyer_id, [])
+    
+    # Находим и удаляем сделку
+    for idx, sdeal in enumerate(seller_deals):
+        if sdeal["product_id"] == product_id and sdeal["buyer_id"] == buyer_id:
+            seller_deals.pop(idx)
+            break
+    
+    for idx, bdeal in enumerate(buyer_deals):
+        if bdeal["product_id"] == product_id and bdeal["seller_id"] == seller_id:
+            buyer_deals.pop(idx)
+            break
+    
+    # Обновляем списки
+    if seller_deals:
+        active_deals[seller_id] = seller_deals
+    else:
+        if seller_id in active_deals:
+            del active_deals[seller_id]
+        if seller_id in current_chat_deal:
+            del current_chat_deal[seller_id]
+    
+    if buyer_deals:
+        active_deals[buyer_id] = buyer_deals
+    else:
+        if buyer_id in active_deals:
+            del active_deals[buyer_id]
+        if buyer_id in current_chat_deal:
+            del current_chat_deal[buyer_id]
     
     logger.info(f"Сделка завершена: продавец {seller_id} <-> покупатель {buyer_id}, сумма: {price}")
     logger.info(f"Товар {product_id} передан покупателю {buyer_id}")
@@ -1852,111 +1990,10 @@ async def process_card_number_withdrawal(message: Message, state: FSMContext):
     
     await state.clear()
 
-@dp.callback_query(WithdrawalStates.selecting_method, F.data.in_(["withdraw_btc", "withdraw_eth", "withdraw_usdt"]))
-async def process_crypto_withdrawal_start(callback: CallbackQuery, state: FSMContext):
-    """Начало вывода крипты"""
-    await callback.answer()
-    
-    crypto = callback.data.replace("withdraw_", "").upper()
-    await state.update_data(crypto=crypto)
-    
-    # Выбор сети
-    networks = []
-    if crypto == "USDT":
-        networks = [
-            [InlineKeyboardButton(text="TRC-20 (Tron)", callback_data="network_trc20")],
-            [InlineKeyboardButton(text="ERC-20 (Ethereum)", callback_data="network_erc20")],
-            [InlineKeyboardButton(text="BEP-20 (BSC)", callback_data="network_bep20")],
-        ]
-    elif crypto == "BTC":
-        networks = [
-            [InlineKeyboardButton(text="Bitcoin Network", callback_data="network_btc")],
-        ]
-    elif crypto == "ETH":
-        networks = [
-            [InlineKeyboardButton(text="ERC-20 (Ethereum)", callback_data="network_erc20")],
-        ]
-    
-    networks.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
-    
-    await callback.message.answer(
-        f"Выберите сеть для {crypto}:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=networks)
-    )
-    await state.set_state(WithdrawalStates.selecting_crypto_network)
-
-@dp.callback_query(WithdrawalStates.selecting_crypto_network, F.data.startswith("network_"))
-async def process_crypto_network_withdrawal(callback: CallbackQuery, state: FSMContext):
-    """Выбор сети крипты для вывода"""
-    await callback.answer()
-    
-    network = callback.data.replace("network_", "").upper()
-    await state.update_data(network=network)
-    
-    data = await state.get_data()
-    crypto = data.get("crypto")
-    
-    await callback.message.answer(
-        f"Введите адрес кошелька {crypto} ({network}):"
-    )
-    await state.set_state(WithdrawalStates.waiting_for_crypto_address)
-
-@dp.message(WithdrawalStates.waiting_for_crypto_address)
-async def process_crypto_address_withdrawal(message: Message, state: FSMContext):
-    """Обработка адреса крипты для вывода"""
-    address = message.text.strip()
-    data = await state.get_data()
-    
-    crypto = data.get("crypto")
-    network = data.get("network")
-    user_id = message.from_user.id
-    username = message.from_user.username or f"user_{user_id}"
-    balance = await get_user_balance(user_id)
-    
-    # Сохраняем запрос
-    await create_payment_request(user_id, 'withdrawal', {
-        'method': crypto,
-        'amount': balance,
-        'crypto_network': network,
-        'crypto_address': address
-    })
-    
-    # Уведомляем админов
-    admin_text = (
-        f"💸 <b>Запрос на вывод ({crypto})</b>\n\n"
-        f"👤 Пользователь: @{username} (ID: {user_id})\n"
-        f"💰 Сумма: {balance:.2f} ₽\n"
-        f"🌐 Сеть: {network}\n"
-        f"📍 Адрес: <code>{address}</code>\n"
-        f"⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-    )
-    
-    try:
-        await bot.send_message(MAIN_ADMIN_ID, admin_text, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Ошибка уведомления админа: {e}")
-    
-    await message.answer(
-        f"✅ Запрос на вывод отправлен!\n\n"
-        f"Свяжитесь с поддержкой: @{SUPPORT_USERNAME}",
-        reply_markup=get_main_menu(user_id)
-    )
-    
-    await state.clear()
-
-@dp.callback_query(WithdrawalStates.selecting_method, F.data.in_(["withdraw_cryptobot", "withdraw_stars"]))
-async def process_other_withdrawal(callback: CallbackQuery, state: FSMContext):
-    """Обработка других методов вывода"""
-    await callback.answer()
-    
-    method = "CryptoBot" if callback.data == "withdraw_cryptobot" else "Telegram Stars"
-    user_id = callback.from_user.id
-    
-    await callback.message.answer(
-        f"⏳ Для вывода через {method}\n\n"
-        f"Свяжитесь с поддержкой: @{SUPPORT_USERNAME}",
-        reply_markup=get_main_menu(user_id)
-    )
+@dp.callback_query(WithdrawalStates.selecting_method, F.data.in_(["withdraw_btc", "withdraw_eth", "withdraw_usdt", "withdraw_cryptobot", "withdraw_stars"]))
+async def process_unavailable_withdrawal(callback: CallbackQuery, state: FSMContext):
+    """Недоступные методы вывода"""
+    await callback.answer("❌ Вывод недоступен. Доступны только карты.", show_alert=True)
     await state.clear()
 
 # ================== ОБРАБОТЧИКИ СООБЩЕНИЙ В СДЕЛКЕ ==================
@@ -1966,23 +2003,52 @@ async def process_deal_message(message: Message):
     """Обработка сообщений в сделке"""
     user_id = message.from_user.id
     
-    if user_id not in active_deals:
+    user_deals = active_deals.get(user_id, [])
+    
+    if not user_deals:
         return
     
-    partner_id = active_deals[user_id]["partner_id"]
+    # Получаем индекс текущей активной сделки
+    deal_index = current_chat_deal.get(user_id, 0)
+    
+    if deal_index >= len(user_deals):
+        deal_index = 0
+        current_chat_deal[user_id] = 0
+    
+    deal = user_deals[deal_index]
+    partner_id = deal["partner_id"]
     username = message.from_user.username or f"user_{user_id}"
     
     await ensure_user_exists(user_id, message.from_user.username)
     await add_message(user_id, partner_id, user_id, f"[{username}]: {message.text}")
     
     try:
-        is_buyer = active_deals[partner_id]["buyer_id"] == partner_id
-        await bot.send_message(
-            partner_id,
-            f"💬 @{username}:\n{message.text}",
-            reply_markup=get_chat_keyboard(is_buyer=is_buyer)
-        )
-        logger.info(f"Сообщение переслано: {user_id} -> {partner_id}")
+        # Находим сделку партнера с этим пользователем
+        partner_deals = active_deals.get(partner_id, [])
+        partner_deal_index = None
+        
+        for idx, pdeal in enumerate(partner_deals):
+            if pdeal["partner_id"] == user_id and pdeal["product_id"] == deal["product_id"]:
+                partner_deal_index = idx
+                break
+        
+        if partner_deal_index is not None:
+            partner_deal = partner_deals[partner_deal_index]
+            is_buyer = partner_deal["buyer_id"] == partner_id
+            
+            # Определяем номер сделки для партнера
+            deal_number = partner_deal_index + 1
+            total_deals = len(partner_deals)
+            
+            # Помечаем из какой сделки пришло сообщение
+            deal_label = f"[Сделка {deal_number}/{total_deals}]" if total_deals > 1 else ""
+            
+            await bot.send_message(
+                partner_id,
+                f"{deal_label} 💬 @{username}:\n{message.text}",
+                reply_markup=get_chat_keyboard(is_buyer=is_buyer)
+            )
+            logger.info(f"Сообщение переслано: {user_id} -> {partner_id} (сделка {deal_number})")
     except Exception as e:
         logger.error(f"Ошибка пересылки сообщения: {e}")
         await message.answer("❌ Не удалось доставить сообщение")
