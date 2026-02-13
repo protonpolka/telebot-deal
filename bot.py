@@ -594,7 +594,8 @@ def get_main_menu(user_id: int = None):
 def get_chat_keyboard(is_buyer: bool = False):
     """Клавиатура чата"""
     buttons = [
-        [InlineKeyboardButton(text="📋 Активные сделки", callback_data="active_deals")]
+        [InlineKeyboardButton(text="📋 Активные сделки", callback_data="active_deals")],
+        [InlineKeyboardButton(text="❌ Отменить сделку", callback_data="cancel_deal")]
     ]
     if is_buyer:
         buttons.insert(0, [InlineKeyboardButton(text="✅ Подтвердить получение", callback_data="confirm_receipt")])
@@ -1220,6 +1221,149 @@ async def process_accept_deal(callback: CallbackQuery):
         )
     except Exception as e:
         logger.error(f"Ошибка уведомления продавца: {e}")
+
+@dp.callback_query(F.data == "cancel_deal")
+async def process_cancel_deal(callback: CallbackQuery):
+    """Отмена текущей сделки"""
+    await callback.answer()
+    
+    user_id = callback.from_user.id
+    user_deals = active_deals.get(user_id, [])
+    
+    if not user_deals:
+        await callback.answer("❌ У вас нет активных сделок", show_alert=True)
+        return
+    
+    # Получаем текущую сделку
+    deal_index = current_chat_deal.get(user_id, 0)
+    if deal_index >= len(user_deals):
+        deal_index = 0
+    
+    deal = user_deals[deal_index]
+    partner_id = deal["partner_id"]
+    product = deal["product"]
+    buyer_id = deal["buyer_id"]
+    seller_id = deal["seller_id"]
+    product_id = deal["product_id"]
+    
+    # Подтверждение отмены
+    buttons = [
+        [InlineKeyboardButton(text="✅ Да, отменить", callback_data="confirm_cancel_deal")],
+        [InlineKeyboardButton(text="❌ Нет, вернуться", callback_data="back_to_chat")]
+    ]
+    
+    await callback.message.answer(
+        f"⚠️ <b>Отмена сделки</b>\n\n"
+        f"📦 Товар: {product['name']}\n"
+        f"💰 Цена: {product['price']}\n\n"
+        f"Вы уверены что хотите отменить эту сделку?\n\n"
+        f"⚠️ Средства будут возвращены покупателю!",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+@dp.callback_query(F.data == "back_to_chat")
+async def back_to_chat(callback: CallbackQuery):
+    """Возврат в чат"""
+    await callback.answer("Продолжайте общение")
+    await callback.message.delete()
+
+@dp.callback_query(F.data == "confirm_cancel_deal")
+async def confirm_cancel_deal(callback: CallbackQuery):
+    """Подтверждение отмены сделки"""
+    await callback.answer()
+    
+    user_id = callback.from_user.id
+    user_deals = active_deals.get(user_id, [])
+    
+    if not user_deals:
+        await callback.answer("❌ У вас нет активных сделок", show_alert=True)
+        return
+    
+    # Получаем текущую сделку
+    deal_index = current_chat_deal.get(user_id, 0)
+    if deal_index >= len(user_deals):
+        deal_index = 0
+    
+    deal = user_deals[deal_index]
+    partner_id = deal["partner_id"]
+    buyer_id = deal["buyer_id"]
+    seller_id = deal["seller_id"]
+    product = deal["product"]
+    product_id = deal["product_id"]
+    price = parse_price(product["price"])
+    
+    # Возвращаем деньги покупателю
+    buyer_balance = await get_user_balance(buyer_id)
+    await update_balance(buyer_id, buyer_balance + price)
+    
+    # Удаляем сделку из списков обоих участников
+    seller_deals = active_deals.get(seller_id, [])
+    buyer_deals = active_deals.get(buyer_id, [])
+    
+    # Находим и удаляем сделку
+    for idx, sdeal in enumerate(seller_deals):
+        if sdeal["product_id"] == product_id and sdeal["buyer_id"] == buyer_id:
+            seller_deals.pop(idx)
+            break
+    
+    for idx, bdeal in enumerate(buyer_deals):
+        if bdeal["product_id"] == product_id and bdeal["seller_id"] == seller_id:
+            buyer_deals.pop(idx)
+            break
+    
+    # Обновляем списки
+    if seller_deals:
+        active_deals[seller_id] = seller_deals
+    else:
+        if seller_id in active_deals:
+            del active_deals[seller_id]
+        if seller_id in current_chat_deal:
+            del current_chat_deal[seller_id]
+    
+    if buyer_deals:
+        active_deals[buyer_id] = buyer_deals
+    else:
+        if buyer_id in active_deals:
+            del active_deals[buyer_id]
+        if buyer_id in current_chat_deal:
+            del current_chat_deal[buyer_id]
+    
+    logger.info(f"Сделка отменена: продавец {seller_id} <-> покупатель {buyer_id}")
+    
+    # Уведомляем обоих участников
+    new_buyer_balance = await get_user_balance(buyer_id)
+    
+    try:
+        await bot.send_message(
+            partner_id,
+            f"❌ <b>Сделка отменена!</b>\n\n"
+            f"📦 Товар: {product['name']}\n"
+            f"💰 Цена: {product['price']}\n\n"
+            f"Партнёр отменил сделку.",
+            parse_mode="HTML",
+            reply_markup=get_main_menu(partner_id)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка уведомления партнера: {e}")
+    
+    if user_id == buyer_id:
+        # Покупатель отменил
+        await callback.message.answer(
+            f"❌ <b>Сделка отменена!</b>\n\n"
+            f"💰 Возвращено на баланс: {price:.2f} ₽\n"
+            f"💳 Новый баланс: {new_buyer_balance:.2f} ₽",
+            parse_mode="HTML",
+            reply_markup=get_main_menu(user_id)
+        )
+    else:
+        # Продавец отменил
+        await callback.message.answer(
+            f"❌ <b>Сделка отменена!</b>\n\n"
+            f"💰 Покупателю возвращено: {price:.2f} ₽",
+            parse_mode="HTML",
+            reply_markup=get_main_menu(user_id)
+        )
 
 @dp.callback_query(F.data == "confirm_receipt")
 async def process_confirm_receipt(callback: CallbackQuery):
@@ -2235,7 +2379,7 @@ async def admin_add_admin_process(message: Message, state: FSMContext):
         await message.answer("❌ Отменено")
         return
     
-    username = message.text.strip()
+    username = message.text.strip().lstrip('@')
     user_id = await get_user_by_username(username)
     
     if user_id is None:
@@ -2256,8 +2400,13 @@ async def admin_add_admin_process(message: Message, state: FSMContext):
         await state.clear()
         return
     
+    # Убедимся что пользователь существует в БД
+    await ensure_user_exists(user_id, username)
+    
     # Добавляем в БД
     await add_admin_to_db(user_id, username, message.from_user.id)
+    
+    logger.info(f"Админ добавлен: {user_id} (@{username}) главным админом {message.from_user.id}")
     
     # Уведомляем пользователя
     try:
