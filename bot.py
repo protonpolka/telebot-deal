@@ -677,6 +677,11 @@ def get_product_categories_keyboard():
         [InlineKeyboardButton(text="🔫 STANDOFF 2", callback_data="cat_standoff")],
         [InlineKeyboardButton(text="🎨 NFT GIFT", callback_data="cat_nft")],
         [InlineKeyboardButton(text="⭐️ TELEGRAM STARS", callback_data="cat_stars")],
+        [InlineKeyboardButton(text="🌸 GENSHIN IMPACT", callback_data="cat_genshin")],
+        [InlineKeyboardButton(text="⚔️ LEAGUE OF LEGENDS", callback_data="cat_lol")],
+        [InlineKeyboardButton(text="🚗 CRMP", callback_data="cat_crmp")],
+        [InlineKeyboardButton(text="🏙️ SAMP", callback_data="cat_samp")],
+        [InlineKeyboardButton(text="📦 Прочее", callback_data="cat_other")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
     ])
 
@@ -1801,6 +1806,56 @@ async def process_category_selection(callback: CallbackQuery, state: FSMContext)
             "(подробно опишите товар)",
             parse_mode="HTML"
         )
+        await state.set_state(ProductStates.waiting_for_product_description)
+
+    elif category == "GENSHIN":
+        await callback.message.answer(
+            "🌸 <b>GENSHIN IMPACT</b>\n\n"
+            "📝 Опишите что вы продаёте:\n"
+            "(подробно опишите товар)",
+            parse_mode="HTML"
+        )
+        await state.update_data(email="—", password="—")
+        await state.set_state(ProductStates.waiting_for_product_description)
+
+    elif category == "LOL":
+        await callback.message.answer(
+            "⚔️ <b>LEAGUE OF LEGENDS</b>\n\n"
+            "📝 Опишите что вы продаёте:\n"
+            "(подробно опишите товар)",
+            parse_mode="HTML"
+        )
+        await state.update_data(email="—", password="—")
+        await state.set_state(ProductStates.waiting_for_product_description)
+
+    elif category == "CRMP":
+        await callback.message.answer(
+            "🚗 <b>CRMP</b>\n\n"
+            "📝 Опишите что вы продаёте:\n"
+            "(подробно опишите товар)",
+            parse_mode="HTML"
+        )
+        await state.update_data(email="—", password="—")
+        await state.set_state(ProductStates.waiting_for_product_description)
+
+    elif category == "SAMP":
+        await callback.message.answer(
+            "🏙️ <b>SAMP</b>\n\n"
+            "📝 Опишите что вы продаёте:\n"
+            "(подробно опишите товар)",
+            parse_mode="HTML"
+        )
+        await state.update_data(email="—", password="—")
+        await state.set_state(ProductStates.waiting_for_product_description)
+
+    elif category == "OTHER":
+        await callback.message.answer(
+            "📦 <b>Прочее</b>\n\n"
+            "📝 Опишите что вы продаёте:\n"
+            "(подробно опишите товар)",
+            parse_mode="HTML"
+        )
+        await state.update_data(email="—", password="—")
         await state.set_state(ProductStates.waiting_for_product_description)
 
 @dp.callback_query(ProductStates.selecting_supercell_type)
