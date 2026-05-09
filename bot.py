@@ -678,7 +678,7 @@ def get_product_categories_keyboard():
         [InlineKeyboardButton(text="🎨 NFT GIFT", callback_data="cat_nft")],
         [InlineKeyboardButton(text="⭐️ TELEGRAM STARS", callback_data="cat_stars")],
         [InlineKeyboardButton(text="🌸 GENSHIN IMPACT", callback_data="cat_genshin")],
-        [InlineKeyboardButton(text="⚔️ LEAGUE OF LEGENDS", callback_data="cat_lol")],
+        [InlineKeyboardButton(text="⚔️ MOBILE LEGENDS", callback_data="cat_mobilelegends")],
         [InlineKeyboardButton(text="🚗 CRMP", callback_data="cat_crmp")],
         [InlineKeyboardButton(text="🏙️ SAMP", callback_data="cat_samp")],
         [InlineKeyboardButton(text="📦 Прочее", callback_data="cat_other")],
@@ -1818,9 +1818,9 @@ async def process_category_selection(callback: CallbackQuery, state: FSMContext)
         await state.update_data(email="—", password="—")
         await state.set_state(ProductStates.waiting_for_product_description)
 
-    elif category == "LOL":
+    elif category == "MOBILELEGENDS":
         await callback.message.answer(
-            "⚔️ <b>LEAGUE OF LEGENDS</b>\n\n"
+            "⚔️ <b>MOBILE LEGENDS</b>\n\n"
             "📝 Опишите что вы продаёте:\n"
             "(подробно опишите товар)",
             parse_mode="HTML"
